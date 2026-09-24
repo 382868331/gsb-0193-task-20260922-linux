@@ -35,6 +35,8 @@ from dataclasses import dataclass
 # Hard interface bounds fixed by the task.
 MAX_APERTURE = 32
 MAX_PADDED = 64
+MAX_MODES = 3
+MAX_WAVELENGTHS = 3
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,86 @@ class FraunhoferResult:
     input_power: float
     output_power: float
     power_error: float
+    n: int
+    m: int
+
+
+@dataclass(frozen=True)
+class CoherentMode:
+    """One coherent mode: an aperture illuminated at one wavelength.
+
+    Fields of *different* modes are mutually incoherent: they are never added
+    as complex amplitudes.  Modes sharing a wavelength are still treated as
+    incoherent (e.g. orthogonal spatial modes); only the weighted intensities
+    are summed.
+
+    Attributes
+    ----------
+    aperture:
+        N x N iterable of iterables of ``int | float | complex``, 1 <= N <= 32,
+        centered layout.  All modes in one :func:`fraunhofer_modes` call must
+        share the same N (and the common ``dx``).
+    wavelength:
+        Optical wavelength in metres (finite, > 0).  At most
+        ``MAX_WAVELENGTHS`` distinct values are allowed per call.
+    weight:
+        Non-negative finite real intensity weight ``w`` of the mode.  The mode
+        contributes ``w * |U|**2`` to the summed intensity grid.
+    """
+
+    aperture: list
+    wavelength: float
+    weight: float = 1.0
+
+
+@dataclass(frozen=True)
+class MultiModeResult:
+    """Incoherent superposition of independently propagated coherent modes.
+
+    Attributes
+    ----------
+    intensity:
+        M x M ``float`` grid, ``sum_q weight_q * |U_q|**2``, in the same
+        centered (fftshifted) layout as :attr:`FraunhoferResult.intensity`.
+        There is deliberately **no** ``field`` attribute: fields of different
+        wavelengths (and incoherent modes in general) must not be added as
+        complex amplitudes, so no cross-mode complex field exists here.
+    fx, fy:
+        Length-M spatial-frequency coordinates in cycles/metre,
+        ``(p - M//2) / (M*dx)``.  These are the wavelength-independent common
+        axis of the sum; mode ``q``'s physical coordinate at pixel ``p`` is
+        ``mode_results[q].x[p] == wavelength_q * z * fx[p]``.
+    center:
+        Index ``(M // 2, M // 2)`` of the zero coordinate.
+    weights:
+        The validated non-negative mode weights, in input order.
+    wavelengths:
+        The validated mode wavelengths in metres, in input order.
+    input_power:
+        ``sum_q weight_q * dx**2 * sum |A_q|**2``.
+    output_power:
+        ``sum_q weight_q * du_q**2 * sum |U_q|**2``.  Each per-mode term obeys
+        Parseval, so this equals ``input_power`` up to round-off.
+    power_error:
+        Signed relative discrepancy ``(output - input) / input``; ``0.0`` when
+        the total weighted input power is zero.
+    mode_results:
+        The individual :class:`FraunhoferResult` of every mode, in input
+        order.  Per-mode ``field`` / physical ``x`` / ``y`` / ``du`` live here.
+    n, m:
+        Common input aperture side length / transform side length.
+    """
+
+    intensity: list[list[float]]
+    fx: list[float]
+    fy: list[float]
+    center: tuple[int, int]
+    weights: list[float]
+    wavelengths: list[float]
+    input_power: float
+    output_power: float
+    power_error: float
+    mode_results: list[FraunhoferResult]
     n: int
     m: int
 
@@ -366,3 +448,169 @@ def fraunhofer(aperture, dx, wavelength, z, pad: int | None = None) -> Fraunhofe
         n=n,
         m=m,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-wavelength / multi-mode incoherent propagation
+# ---------------------------------------------------------------------------
+
+
+def fraunhofer_modes(modes, dx, z, pad: int | None = None) -> MultiModeResult:
+    """Propagate several coherent modes independently and sum intensities.
+
+    Each :class:`CoherentMode` is propagated on its own with :func:`fraunhofer`
+    (its own wavelength, hence its own ``du`` and physical coordinates), and
+    only the weighted *intensities* are added on the common M x M pixel grid::
+
+        I[p, q] = sum_s weight_s * |U_s[p, q]|**2
+
+    Complex amplitudes are **never** added across modes or wavelengths: light
+    of distinct wavelengths, and incoherent modes in general, does not
+    interfere.  The returned object therefore exposes no summed ``field``;
+    the per-mode complex fields remain available in ``mode_results``.
+
+    All modes share ``dx``, ``z``, the aperture side length N and ``pad``.
+    Between 1 and ``MAX_MODES`` modes are allowed, with at most
+    ``MAX_WAVELENGTHS`` distinct wavelengths.  Every input is validated
+    *before* any propagation runs, so a rejected call performs no computation
+    and leaves no partially updated state (the function is pure).
+
+    Parameters
+    ----------
+    modes:
+        Iterable of 1..3 :class:`CoherentMode` instances with identical N.
+    dx:
+        Common aperture-plane sample pitch in metres (finite, > 0).
+    z:
+        Common propagation distance in metres (finite, > 0).
+    pad:
+        Optional common transform side length M, ``N <= M <= 64``; ``None``
+        uses M = N.
+
+    Returns
+    -------
+    MultiModeResult
+
+    Raises
+    ------
+    TypeError
+        ``modes`` is not an iterable of :class:`CoherentMode`, a weight is not
+        real, or ``pad`` is not a strict int (booleans rejected).
+    ValueError
+        Wrong mode count (outside 1..3), more than 3 distinct wavelengths,
+        negative / non-finite / NaN weights or wavelengths, mismatched
+        aperture sizes, or any underlying :func:`fraunhofer` shape/bounds
+        violation.  Messages locate the offending entry, e.g.
+        ``modes[1].weight`` or ``modes[0].aperture[i][j]``.
+    """
+    if isinstance(modes, (str, bytes)) or not hasattr(modes, "__iter__"):
+        raise TypeError(
+            "modes must be an iterable of CoherentMode, "
+            f"got {type(modes).__name__}"
+        )
+    mode_list = list(modes)
+    if not 1 <= len(mode_list) <= MAX_MODES:
+        raise ValueError(
+            f"modes must contain between 1 and {MAX_MODES} modes, "
+            f"got {len(mode_list)}"
+        )
+    for idx, mode in enumerate(mode_list):
+        if isinstance(mode, bool) or not isinstance(mode, CoherentMode):
+            raise TypeError(
+                f"modes[{idx}] must be a CoherentMode, got {type(mode).__name__}"
+            )
+
+    # Validate and materialize every aperture first so generator inputs cannot
+    # be exhausted halfway through, and so all checks precede any propagation.
+    grids: list[list[list[complex]]] = []
+    n_common: int | None = None
+    for idx, mode in enumerate(mode_list):
+        grid = _parse_aperture_named(mode.aperture, f"modes[{idx}].aperture")
+        n = len(grid)
+        if n_common is None:
+            n_common = n
+        elif n != n_common:
+            raise ValueError(
+                f"modes[{idx}].aperture side length {n} does not match "
+                f"modes[0].aperture side length {n_common}"
+            )
+        grids.append(grid)
+    assert n_common is not None
+    n = n_common
+
+    weights: list[float] = []
+    wavelengths: list[float] = []
+    for idx, mode in enumerate(mode_list):
+        weights.append(_finite_real(mode.weight, f"modes[{idx}].weight", nonneg=True))
+        wavelengths.append(
+            _finite_real(mode.wavelength, f"modes[{idx}].wavelength", positive=True)
+        )
+    distinct_wavelengths = {w for w in wavelengths}
+    if len(distinct_wavelengths) > MAX_WAVELENGTHS:
+        raise ValueError(
+            f"at most {MAX_WAVELENGTHS} distinct wavelengths are allowed, "
+            f"got {len(distinct_wavelengths)}"
+        )
+
+    dx = _finite_real(dx, "dx", positive=True)
+    z = _finite_real(z, "z", positive=True)
+    if pad is None:
+        m = n
+    else:
+        m = _strict_int(pad, "pad", lo=n, hi=MAX_PADDED)
+
+    # All inputs are valid from here on; propagate the modes independently.
+    mode_results: list[FraunhoferResult] = []
+    for grid, wavelength in zip(grids, wavelengths):
+        mode_results.append(fraunhofer(grid, dx, wavelength, z, pad=m))
+
+    intensity: list[list[float]] = [[0.0] * m for _ in range(m)]
+    input_power = 0.0
+    output_power = 0.0
+    for weight, result in zip(weights, mode_results):
+        for i in range(m):
+            row = intensity[i]
+            src = result.intensity
+            for j in range(m):
+                row[j] += weight * src[i][j]
+        input_power += weight * result.input_power
+        output_power += weight * result.output_power
+
+    if input_power == 0.0:
+        power_error = 0.0
+    else:
+        power_error = (output_power - input_power) / input_power
+
+    fx = [(p - m // 2) / (m * dx) for p in range(m)]
+    return MultiModeResult(
+        intensity=intensity,
+        fx=fx,
+        fy=list(fx),
+        center=(m // 2, m // 2),
+        weights=weights,
+        wavelengths=wavelengths,
+        input_power=input_power,
+        output_power=output_power,
+        power_error=power_error,
+        mode_results=mode_results,
+        n=n,
+        m=m,
+    )
+
+
+def _parse_aperture_named(aperture, where: str) -> list[list[complex]]:
+    """Parse an aperture, prefixing every element-level error with ``where``.
+
+    Structural (iterability / rectangularity / squareness / size) failures are
+    re-raised with the same prefix; per-element failures from the shared
+    validator already carry the full path.
+    """
+    if isinstance(aperture, (str, bytes)) or not hasattr(aperture, "__iter__"):
+        raise TypeError(f"{where} must be a 2-D array-like of complex amplitudes")
+    try:
+        return _parse_aperture(aperture)
+    except (TypeError, ValueError) as exc:
+        message = str(exc)
+        if message.startswith("aperture"):
+            raise type(exc)(f"{where}{message[len('aperture'):]}") from None
+        raise type(exc)(f"{where}: {message}") from None

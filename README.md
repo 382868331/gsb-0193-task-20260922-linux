@@ -5,6 +5,12 @@
 生成与居中零填充（≤64×64）。**不使用任何 FFT 包或第三方数值库**，DFT 为自行实现
 的混合基 Cooley–Tukey（素数长度走 O(n²) 直接求和回退）。
 
+本次迭代新增**有限波长、非负权重的相干模态入口** `fraunhofer_modes`：一次调用
+可给 1–3 个 `CoherentMode`（各自孔径、波长、非负权重，至多 3 个不同波长），
+每个模态独立 Fraunhofer 传播，再按 `I = Σ w_q·|U_q|²` 逐像元叠加**强度**；
+跨波长、跨模态的复振幅永不相加（因此结果对象不提供合成 `field`，各模态复场保留
+在 `mode_results` 中）。原有 `fraunhofer` 单模态入口与全部旧行为不变。
+
 ## 运行环境
 
 - Python **3.14.7**（仅使用标准库 `cmath` / `math` / `dataclasses`）
@@ -15,8 +21,8 @@
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（21 个用例）
-python demo.py                            # 固定输入演示，约 0.1 秒（上限 8 秒）
+python -m unittest discover -s tests -v   # 必要测试（37 个用例）
+python demo.py                            # 固定输入演示，约 0.1 秒（上限 90 秒）
 ```
 
 ## 数学约定（固定契约）
@@ -76,15 +82,64 @@ rectangular_aperture(n, width, height, dx)
     # 沿轴0宽 width、沿轴1高 height，含边界；半宽/半高闭区间判定
 ```
 
+## 多波长 / 多模态非相干叠加（本次新增）
+
+```python
+from fourier_diffraction import fraunhofer_modes, CoherentMode
+
+mode = CoherentMode(aperture, wavelength, weight=1.0)
+r = fraunhofer_modes(modes, dx, z, pad=None) -> MultiModeResult
+```
+
+- `CoherentMode`（frozen dataclass）字段：`aperture`（N×N，约束同单模态入口）、
+  `wavelength`（有限正实数，米）、`weight`（有限非负实数，默认 `1.0`；`bool` 按
+  数值传入同样拒绝）。
+- `modes`：1–3 个 `CoherentMode` 的可迭代对象（也接受生成器，会先物化为列表）。
+  各模态必须共享边长 N；一次调用至多 **3 个不同波长**。`dx / z / pad` 全模态共用。
+- 叠加规则（**只叠强度，绝不叠复振幅**）：
+
+  ```
+  I[p,q] = Σ_s weight_s · |U_s[p,q]|²
+  ```
+
+  每个模态各自调用 `fraunhofer` 独立传播，各自有自己的 `du_s = λ_s·z/(M·dx)` 与
+  物理坐标；在共同的 M×M 像元索引网格上加权累加强度。不同波长的光互不相干，
+  同波长的不同空间模态同样按非相干处理（权重即模态功率份额）。
+- `MultiModeResult`（frozen dataclass）字段：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `intensity` | M×M `float`，`Σ_s w_s·|U_s|²`，居中布局 |
+  | `fx`, `fy` | 长度 M 的**空间频率**坐标（cycles/m），`(p−M//2)/(M·dx)`；与波长无关，是叠加网格的公共轴 |
+  | `center` | 零坐标索引 `(M//2, M//2)` |
+  | `weights`, `wavelengths` | 校验后的各模态权重、波长（输入顺序） |
+  | `input_power` | `Σ_s w_s·dx²·Σ|A_s|²` |
+  | `output_power` | `Σ_s w_s·du_s²·Σ|U_s|²`；每模态各自满足 Parseval，故总量守恒到舍入 |
+  | `power_error` | 有符号相对功率误差；总加权输入功率为 0 时显式为 `0.0` |
+  | `mode_results` | 各模态独立的 `FraunhoferResult`（含各自的 `field / x / y / du`） |
+  | `n`, `m` | 公共输入边长 / 变换边长 |
+
+  结果对象**刻意没有 `field` 字段**：跨波长（以及非相干模态之间）不存在可相加的
+  复振幅；需要单模态复场时取 `mode_results[s].field`。物理坐标换算：
+  `mode_results[s].x[p] == wavelength_s · z · fx[p]`。
+- 单模态退化：`fraunhofer_modes([CoherentMode(A, λ, 1.0)], dx, z, pad)` 的
+  `intensity` 与 `fraunhofer(A, dx, λ, z, pad).intensity` 逐像元完全一致。
+- 权重线性：所有权重乘常数 c，叠加强度与总功率整体乘 c（解析关系，测试按
+  2 倍枚举核对）；权重为 0 的模态不产生任何贡献。
+
 ## 错误语义（非法输入不静默纠正）
 
 - `TypeError`：物理量不是实数（`bool` 按数值传入同样拒绝）；`n` / `pad` 不是
   严格 `int`（**`bool` 即使是 `int` 子类也拒绝**）；孔径元素不是数值；孔径不可
-  迭代或行不可迭代。
+  迭代或行不可迭代；`modes` 不可迭代、元素不是 `CoherentMode`（含 `bool`）；
+  模态权重不是实数。
 - `ValueError`：任何实数 / 复数元素为 `NaN` 或 `±Infinity`；`dx/wavelength/z ≤ 0`；
-  `radius/width/height < 0`；空阵、非矩形、非方阵；N<1、N>32、M<N、M>64。
-- 错误信息包含**可定位参数名**（如 `wavelength` 或 `aperture[i][j]`）。
-- 计算为纯函数，无批次 / 有状态写操作，因此不存在部分变更；不存在搜索类算法，
+  `radius/width/height < 0`；空阵、非矩形、非方阵；N<1、N>32、M<N、M>64；
+  模态数不在 1–3；不同波长超过 3 个；模态权重为负或非有限；各模态孔径边长不一致。
+- 错误信息包含**可定位参数名**（如 `wavelength`、`aperture[i][j]`，多模态下为
+  `modes[1].weight`、`modes[0].aperture[i][j]` 等）。
+- `fraunhofer_modes` 在**任何传播之前**完成全部校验（孔径先全部物化解析）；函数
+  为纯函数、无批次 / 有状态写操作，因此不存在部分变更；不存在搜索类算法，
   故无“预算耗尽”与“证明无解”之分（本契约的失败模式只有上面的参数拒绝）。
 
 ## 浮点误差口径（不以宽容差掩盖边界错误）
@@ -108,18 +163,32 @@ rectangular_aperture(n, width, height, dx)
 与对称性、Parseval 独立核功率、零填充功率不变与间距更新、相位斜坡导致的整数像元
 平移（移位定理）、奇偶网格 fftshift 坐标约定、全部错误语义。
 
+多模态新增覆盖（期望值同样不来自被测核心）：单模态退化逐 bin 与旧入口一致；
+双波长单像元的**手算常数场**叠加与加权 Parseval；3 模态 3 波长在独立暴力 DFT
+参考上逐像元一致；权重加倍全场加倍的线性关系；离轴像元证明“只叠强度”无干涉条纹
+（并用各模态 `field` 演示错误的跨模态复场相加确会振荡）；公共 `fx` 轴与
+`x_q = λ_q·z·fx`、`du ∝ λ` 关系；零权重 / 零孔径边界；frozen 不可变；模态数、
+类型、权重、波长、孔径尺寸、公共物理量与 pad 的全部失败路径及可定位信息；
+拒绝后重试结果不变（无半更新）。
+
 ## 设计取舍
 
 - Fraunhofer（远场）模型是本库唯一物理模型；不实现 Fresnel / 角谱传播。
+- 多模态叠加只输出强度（非相干叠加的物理定义）；即便各模态波长相同也不提供复场
+  求和，避免把正交/非相干模态误当成相干光束。跨波长比较位置请用公共 `fx/fy` 轴。
+- 各模态共用 N、`dx`、`z`、`pad`（共同像元网格是强度逐 bin 相加的前提）；波长与
+  权重按模态独立。
 - 居中嵌入与 fftshift 采用统一模运算映射（非负、不创建负索引），对奇偶 N、M 一致。
-- DFT 输入规模很小（≤64），优先正确性与可读性；混合基 + 素数回退使 64 长度变换
-  仍是毫秒级，不为此引入第三方库。
+- DFT 输入规模很小（≤64，模态 ≤3），优先正确性与可读性；混合基 + 素数回退使 64
+  长度变换仍是毫秒级，不为此引入第三方库。
 - 接口只接受 Python 原生嵌套序列，返回原生 list，无 numpy 依赖。
 
 ## 已知限制
 
-- 仅实现本题契约的数学子集：标量传播、均匀采样、单次传播；**不宣称**与任何行业
-  标准光学软件兼容。
+- 仅实现本题契约的数学子集：标量传播、均匀采样、单次传播、**至多 3 个模态与 3 个
+  不同波长**；**不宣称**与任何行业标准光学软件兼容。
+- 多模态结果无合成复场（设计如此）；不模拟色散介质、波长相关孔径响应或模态间
+  相干性/部分相干（互相干矩阵）。
 - 不做近场/倾斜因子/孔径内振幅包络以外的物理效应；`U` 的全局常数相位
   Fraunhofer 相位项按题面公式省略。
 - 64 点素数回退路径只在非 2/3 因子长度出现（如 M 为素数，最大为 61），仍为

@@ -411,5 +411,354 @@ class TestErrors(unittest.TestCase):
             fd.fraunhofer(1.5, 1.0, 1.0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Independent reference for the full single-mode Fraunhofer intensity
+# (brute-force DFT + physics scaling + fftshift; never calls the core)
+# ---------------------------------------------------------------------------
+
+
+def direct_fraunhofer_intensity(grid, dx, wavelength, z, m):
+    n = len(grid)
+    emb = [[0j] * m for _ in range(m)]
+    for i in range(n):
+        mi = (i - n // 2) % m
+        for j in range(n):
+            emb[mi][(j - n // 2) % m] = complex(grid[i][j])
+    rows = [direct_dft1(row, -1) for row in emb]
+    scale = dx * dx / (wavelength * z)
+    out = [[0.0] * m for _ in range(m)]
+    for k in range(m):
+        for l in range(m):
+            s = 0j
+            for i in range(m):
+                s += rows[i][l] * cmath.exp(-2j * math.pi * k * i / m)
+            u = scale * s
+            out[(k + m // 2) % m][(l + m // 2) % m] = u.real ** 2 + u.imag ** 2
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-mode / multi-wavelength incoherent propagation
+# ---------------------------------------------------------------------------
+
+
+class TestMultiModeNormal(unittest.TestCase):
+    def test_single_mode_degenerates_to_single_entry(self):
+        # Explicitly required degeneracy: one mode, weight 1 is the old call.
+        n = 8
+        a = [
+            [complex((i * 3 + j) % 2, (i + j) % 3 - 1) for j in range(n)]
+            for i in range(n)
+        ]
+        dx, wavelength, z, pad = 1.7e-6, 5.3e-7, 0.08, 16
+        single = fd.fraunhofer(a, dx, wavelength, z, pad=pad)
+        multi = fd.fraunhofer_modes(
+            [fd.CoherentMode(a, wavelength)], dx, z, pad=pad
+        )
+        self.assertEqual(multi.n, n)
+        self.assertEqual(multi.m, pad)
+        self.assertEqual(multi.weights, [1.0])
+        self.assertEqual(multi.wavelengths, [wavelength])
+        for i in range(pad):
+            for j in range(pad):
+                self.assertEqual(multi.intensity[i][j], single.intensity[i][j])
+        # The per-mode result is the ordinary result, field included.
+        self.assertEqual(multi.mode_results[0].field, single.field)
+        self.assertAlmostEqual(multi.power_error, single.power_error, delta=1e-18)
+        # No summed complex field can exist by construction.
+        self.assertFalse(hasattr(multi, "field"))
+
+    def test_hand_computed_single_pixel_two_wavelengths(self):
+        # Centered single pixels: each mode's field is the constant
+        # U_q = dx^2/(lambda_q z) * amplitude_q in every bin, so the summed
+        # intensity per bin is the hand-summed constant below.
+        dx, z = 1e-5, 0.1
+        lam1, lam2 = 4.0e-7, 7.0e-7
+        w1, w2 = 2.0, 0.5
+        amp1, amp2 = 3.0, 2.0j
+        m = 6
+        r = fd.fraunhofer_modes(
+            [
+                fd.CoherentMode([[amp1]], lam1, w1),
+                fd.CoherentMode([[amp2]], lam2, w2),
+            ],
+            dx, z, pad=m,
+        )
+        s1 = dx * dx / (lam1 * z) * abs(amp1)
+        s2 = dx * dx / (lam2 * z) * abs(amp2)
+        expected = w1 * s1 * s1 + w2 * s2 * s2
+        for row in r.intensity:
+            for v in row:
+                self.assertAlmostEqual(v, expected, delta=1e-12 * expected)
+
+        # Weighted Parseval, hand summed.
+        pin = (
+            w1 * dx * dx * abs(amp1) ** 2
+            + w2 * dx * dx * abs(amp2) ** 2
+        )
+        self.assertLess(abs(r.input_power - pin) / pin, 1e-15)
+        self.assertLess(abs(r.output_power - pin) / pin, 1e-12)
+        self.assertLess(abs(r.power_error), 1e-12)
+
+    def test_weights_are_linear_independent_reference(self):
+        # 3 modes, distinct wavelengths, arbitrary complex 4x4 apertures,
+        # padding to 5, checked against the brute-force reference.
+        n, m = 4, 5
+        dx, z = 2.3e-6, 0.05
+        lams = [4.0e-7, 5.5e-7, 7.0e-7]
+        weights = [0.5, 1.0, 2.25]
+        apertures = [
+            [[complex((i + q) % 3 - 1, (i * j + q) % 4 - 1.5) for j in range(n)]
+             for i in range(n)]
+            for q in range(3)
+        ]
+        modes = [fd.CoherentMode(a, lam, w)
+                 for a, lam, w in zip(apertures, lams, weights)]
+        r = fd.fraunhofer_modes(modes, dx, z, pad=m)
+
+        expected = [[0.0] * m for _ in range(m)]
+        pin = 0.0
+        for a, lam, w in zip(apertures, lams, weights):
+            ref = direct_fraunhofer_intensity(a, dx, lam, z, m)
+            for i in range(m):
+                for j in range(m):
+                    expected[i][j] += w * ref[i][j]
+            pin += w * parseval_sum(a, dx)
+
+        scale = max(max(row) for row in expected)
+        for i in range(m):
+            for j in range(m):
+                self.assertLess(
+                    abs(r.intensity[i][j] - expected[i][j]),
+                    1e-12 * scale,
+                    msg=(i, j),
+                )
+        self.assertLess(abs(r.output_power - pin) / pin, 1e-12)
+        self.assertLess(abs(r.power_error), 1e-12)
+
+        # Linearity in the weights: doubling every weight doubles every bin
+        # and the total powers, with no change to per-mode fields.
+        r2 = fd.fraunhofer_modes(
+            [fd.CoherentMode(a, lam, 2.0 * w)
+             for a, lam, w in zip(apertures, lams, weights)],
+            dx, z, pad=m,
+        )
+        for i in range(m):
+            for j in range(m):
+                self.assertAlmostEqual(
+                    r2.intensity[i][j], 2.0 * r.intensity[i][j],
+                    delta=1e-12 * scale,
+                )
+        self.assertAlmostEqual(r2.input_power, 2.0 * r.input_power,
+                               delta=1e-12 * r2.input_power)
+
+    def test_intensities_add_even_when_fields_would_interfere(self):
+        # Two off-center single pixels at different wavelengths carry linear
+        # phases.  Adding complex amplitudes would produce bin-dependent
+        # interference; the incoherent intensity sum must stay bin-independent.
+        n = 5
+        a1 = [[0j] * n for _ in range(n)]
+        a2 = [[0j] * n for _ in range(n)]
+        a1[0][1] = 1.0
+        a2[4][1] = 1.0
+        dx, z = 1e-5, 0.1
+        lam1, lam2 = 4.5e-7, 6.5e-7
+        r = fd.fraunhofer_modes(
+            [fd.CoherentMode(a1, lam1), fd.CoherentMode(a2, lam2)], dx, z
+        )
+        s1 = dx * dx / (lam1 * z)
+        s2 = dx * dx / (lam2 * z)
+        expected = s1 * s1 + s2 * s2
+        flats = [v for row in r.intensity for v in row]
+        self.assertLess(max(flats) - min(flats), 1e-12 * expected)
+        for v in flats:
+            self.assertLess(abs(v - expected), 1e-12 * expected)
+
+        # Demonstrate with the returned per-mode fields that the forbidden
+        # cross-mode complex addition would in fact oscillate with the bin.
+        u1 = [r.mode_results[0].field[i][1] for i in range(n)]
+        u2 = [r.mode_results[1].field[i][1] for i in range(n)]
+        cross = [abs(p + q) ** 2 for p, q in zip(u1, u2)]
+        self.assertGreater(max(cross) - min(cross), 1e-6 * expected)
+
+    def test_common_frequency_axis_and_per_wavelength_coordinates(self):
+        n, m = 3, 8
+        dx, z = 1e-5, 0.1
+        lam1, lam2 = 4.0e-7, 6.0e-7
+        a1 = [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        a2 = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
+        r = fd.fraunhofer_modes(
+            [fd.CoherentMode(a1, lam1), fd.CoherentMode(a2, lam2)],
+            dx, z, pad=m,
+        )
+        self.assertEqual(r.center, (m // 2, m // 2))
+        for p in range(m):
+            fx = (p - m // 2) / (m * dx)
+            self.assertAlmostEqual(r.fx[p], fx, delta=1e-20)
+            self.assertAlmostEqual(r.fy[p], fx, delta=1e-20)
+            # mode q physical coordinate = lambda_q * z * fx
+            self.assertAlmostEqual(r.mode_results[0].x[p], lam1 * z * fx,
+                                   delta=1e-14 * abs(lam1 * z * fx) + 1e-30)
+            self.assertAlmostEqual(r.mode_results[1].x[p], lam2 * z * fx,
+                                   delta=1e-14 * abs(lam2 * z * fx) + 1e-30)
+        # du scales linearly with the wavelength.
+        self.assertAlmostEqual(
+            r.mode_results[1].du / r.mode_results[0].du, lam2 / lam1,
+            delta=1e-14,
+        )
+
+    def test_three_modes_three_wavelengths_and_generator_input(self):
+        n = 6
+        aps = [
+            fd.rectangular_aperture(n, 2.0, 4.0, 1.0),
+            fd.circular_aperture(n, 1.5, 1.0),
+            [[complex((i + j) % 2, 0.0) for j in range(n)] for i in range(n)],
+        ]
+        lams = [4.0e-7, 5.0e-7, 6.0e-7]
+        r = fd.fraunhofer_modes(
+            (fd.CoherentMode(a, lam) for a, lam in zip(aps, lams)),
+            dx=1.0, z=1.0,
+        )
+        self.assertEqual(len(r.mode_results), 3)
+        self.assertEqual(len({w for w in r.wavelengths}), 3)
+        self.assertEqual(r.m, n)
+
+    def test_zero_weight_and_zero_aperture(self):
+        # A zero-weight mode contributes nothing; compare with a hand value.
+        dx, z, lam = 1e-5, 0.1, 5e-7
+        a = [[1.0]]
+        r = fd.fraunhofer_modes(
+            [fd.CoherentMode(a, lam, 0.0), fd.CoherentMode(a, lam, 3.0)],
+            dx, z, pad=4,
+        )
+        s = dx * dx / (lam * z)
+        expected_zw = 3.0 * s * s
+        for row in r.intensity:
+            for v in row:
+                self.assertAlmostEqual(v, expected_zw, delta=1e-14 * expected_zw)
+        # Everything zero: explicit 0.0 power error, like the single entry.
+        r0 = fd.fraunhofer_modes(
+            [fd.CoherentMode([[0.0, 0.0], [0.0, 0.0]], lam, 0.0)], 1.0, 1.0
+        )
+        self.assertEqual(r0.input_power, 0.0)
+        self.assertEqual(r0.output_power, 0.0)
+        self.assertEqual(r0.power_error, 0.0)
+        self.assertEqual(max(max(row) for row in r0.intensity), 0.0)
+
+    def test_results_are_frozen(self):
+        r = fd.fraunhofer_modes([fd.CoherentMode([[1.0]], 1.0)], 1.0, 1.0)
+        with self.assertRaises(Exception):
+            r.intensity = []  # type: ignore[misc]
+        mode = fd.CoherentMode([[1.0]], 1.0)
+        with self.assertRaises(Exception):
+            mode.weight = 2.0  # type: ignore[misc]
+
+
+class TestMultiModeErrors(unittest.TestCase):
+    def test_mode_count_bounds(self):
+        a = [[1.0]]
+        for count in (0, 4):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError) as cm:
+                    fd.fraunhofer_modes(
+                        [fd.CoherentMode(a, 5e-7) for _ in range(count)],
+                        1.0, 1.0,
+                    )
+                self.assertIn("modes", str(cm.exception))
+
+    def test_modes_container_and_element_types(self):
+        with self.assertRaises(TypeError):
+            fd.fraunhofer_modes(3, 1.0, 1.0)
+        with self.assertRaises(TypeError) as cm:
+            fd.fraunhofer_modes([("ap", 5e-7)], 1.0, 1.0)
+        self.assertIn("modes[0]", str(cm.exception))
+        with self.assertRaises(TypeError):
+            fd.fraunhofer_modes([True], 1.0, 1.0)
+
+    def test_weight_validation_is_localized(self):
+        a = [[1.0]]
+        for bad, kind in [(-0.1, ValueError), (float("nan"), ValueError),
+                          (float("inf"), ValueError), ("1.0", TypeError),
+                          (True, TypeError)]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(kind) as cm:
+                    fd.fraunhofer_modes(
+                        [fd.CoherentMode(a, 5e-7, 1.0),
+                         fd.CoherentMode(a, 6e-7, bad)],
+                        1.0, 1.0,
+                    )
+                self.assertIn("modes[1].weight", str(cm.exception))
+
+    def test_wavelength_validation_is_localized(self):
+        a = [[1.0]]
+        for bad, kind in [(0.0, ValueError), (-5e-7, ValueError),
+                          (float("nan"), ValueError), (1j, TypeError)]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(kind) as cm:
+                    fd.fraunhofer_modes(
+                        [fd.CoherentMode(a, 5e-7), fd.CoherentMode(a, bad)],
+                        1.0, 1.0,
+                    )
+                self.assertIn("modes[1].wavelength", str(cm.exception))
+
+    def test_aperture_sizes_must_match(self):
+        with self.assertRaises(ValueError) as cm:
+            fd.fraunhofer_modes(
+                [fd.CoherentMode([[1.0]], 5e-7),
+                 fd.CoherentMode([[1.0, 0.0], [0.0, 1.0]], 6e-7)],
+                1.0, 1.0,
+            )
+        self.assertIn("modes[1].aperture", str(cm.exception))
+
+    def test_bad_aperture_inside_mode_is_localized(self):
+        # NaN element keeps the full element path.
+        with self.assertRaises(ValueError) as cm:
+            fd.fraunhofer_modes(
+                [fd.CoherentMode([[complex(float("nan"), 0.0)]], 5e-7)],
+                1.0, 1.0,
+            )
+        self.assertIn("modes[0].aperture[0][0]", str(cm.exception))
+        # Non-square structure keeps the mode index.
+        with self.assertRaises(ValueError) as cm:
+            fd.fraunhofer_modes(
+                [fd.CoherentMode([[1.0, 0.0], [0.0]], 5e-7)], 1.0, 1.0
+            )
+        self.assertIn("modes[0].aperture", str(cm.exception))
+        # Non-numeric element.
+        with self.assertRaises(TypeError) as cm:
+            fd.fraunhofer_modes(
+                [fd.CoherentMode([["x"]], 5e-7)], 1.0, 1.0
+            )
+        self.assertIn("modes[0].aperture[0][0]", str(cm.exception))
+
+    def test_common_physical_and_pad_validation(self):
+        a = [[1.0]]
+        with self.assertRaises(ValueError):
+            fd.fraunhofer_modes([fd.CoherentMode(a, 5e-7)], 0.0, 1.0)
+        with self.assertRaises(ValueError):
+            fd.fraunhofer_modes([fd.CoherentMode(a, 5e-7)], 1.0, -1.0)
+        with self.assertRaises(TypeError):
+            fd.fraunhofer_modes([fd.CoherentMode(a, 5e-7)], 1.0, 1.0, pad=False)
+        with self.assertRaises(ValueError):
+            fd.fraunhofer_modes(
+                [fd.CoherentMode([[1.0, 0.0], [0.0, 1.0]], 5e-7)],
+                1.0, 1.0, pad=1,
+            )
+        with self.assertRaises(ValueError):
+            fd.fraunhofer_modes([fd.CoherentMode(a, 5e-7)], 1.0, 1.0, pad=65)
+
+    def test_failure_leaves_no_state(self):
+        # Pure function: a rejected call changes nothing; a valid retry after
+        # a failure returns the deterministic result unchanged.
+        good = fd.CoherentMode([[1.0]], 5e-7)
+        r1 = fd.fraunhofer_modes([good], 1.0, 1.0)
+        with self.assertRaises(ValueError):
+            fd.fraunhofer_modes(
+                [good, fd.CoherentMode([[1.0]], 6e-7, -1.0)], 1.0, 1.0
+            )
+        r2 = fd.fraunhofer_modes([good], 1.0, 1.0)
+        self.assertEqual(r1.intensity, r2.intensity)
+
+
 if __name__ == "__main__":
     unittest.main()
