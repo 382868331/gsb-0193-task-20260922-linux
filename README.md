@@ -4,6 +4,9 @@
 变换得到远场，返回强度、物理坐标、总功率误差与中心索引；支持确定性圆孔 / 矩形孔
 生成与居中零填充（≤64×64）。**不使用任何 FFT 包或第三方数值库**，DFT 为自行实现
 的混合基 Cooley–Tukey（素数长度走 O(n²) 直接求和回退）。
+另含逆问题入口 `inverse_aperture.py`：由指定物理坐标上的**复振幅**观测，
+在固定布尔支持 mask 上矩阵无关地求解 `||F a − b||² + lam·||a||²`（lam>0）
+的正则反演，见下文专节。
 
 ## 运行环境
 
@@ -15,8 +18,9 @@
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（21 个用例）
-python demo.py                            # 固定输入演示，约 0.1 秒（上限 8 秒）
+python -m unittest discover -s tests -v   # 必要测试（37 个用例）
+python demo.py                            # 正向传播固定输入演示，约 0.1 秒（上限 8 秒）
+python demo_inverse.py                    # 逆问题固定输入演示，约 0.2 秒（上限 90 秒）
 ```
 
 ## 数学约定（固定契约）
@@ -76,6 +80,87 @@ rectangular_aperture(n, width, height, dx)
     # 沿轴0宽 width、沿轴1高 height，含边界；半宽/半高闭区间判定
 ```
 
+## 逆问题：由复振幅观测反推有限孔径（`inverse_aperture.py`）
+
+在正向传播之上新增的逆问题入口。观测是**若干指定物理坐标上的复振幅**
+（不是只有强度），孔径支持区由固定布尔 mask 给出，求解
+
+```
+min_a  ||F a − b||² + lam·||a||²,        lam 严格 > 0
+```
+
+其中 `F` 是与正向模型完全一致的 Fraunhofer 算子（复用同一像元中心
+`ξ_m=(m−n//2)·dx`、相位约定 `exp(−i2π(xξ+yη)/(λz))` 与物理比例
+`dx²/(λz)`），在 DFT 网格点上与 `fraunhofer(...)` 的场逐 bin 重合（有测试）。
+
+### 可复现使用路径
+
+```python
+import inverse_aperture as inv
+
+mask = [[True, True], [True, False]]          # N×N 严格 bool，True 为未知量
+observations = [
+    (1.0e-4, -2.0e-4, 0.0123 - 0.004j),        # (x, y, 复振幅)，单位米
+    (1.0e-4, -2.0e-4, 0.0123 - 0.004j),        # 重复观测 = 重复测量，保留不去重
+    (-3.0e-4, 1.0e-4, -0.0021 + 0.009j),
+]
+result = inv.invert_aperture(
+    mask, observations,
+    dx=10e-6, wavelength=0.5e-6, z=0.10,
+    lam=1e-6,                 # 严格 > 0
+    tol=1e-10, max_iter=None, # 默认 1000；到达上限不算收敛
+)
+result.aperture               # N×N 复孔径，mask 外严格为 0j
+result.residual               # 真实残差 F a − b（每个观测一项，重复观测重复出现）
+result.residual_norm          # ||F a − b||
+result.objective              # ||F a − b||² + lam·||a||²（对最终解显式重算）
+result.normal_residual_norm   # ||(F*F + lam I) a − F* b||（显式重算）
+result.converged, result.stop_reason, result.iterations
+```
+
+`stop_reason` 取值：`"converged"` / `"max_iter_reached"` / `"zero_rhs"` /
+`"no_observations"` / `"empty_support"`；只有 `"converged"`（及三个平凡
+情形）时 `converged=True`，**到达迭代上限一律 `converged=False`**。
+
+### 实现要点
+
+- 正向算子 `ApertureOperator.forward` 与共轭转置 `ApertureOperator.adjoint`
+  分别实现；只缓存逐轴可分离相位表（`n_obs × N` 两个），**从不建立**
+  `n_obs × n_unknown` 的稠密傅里叶矩阵。
+- 正规方程 `(F*F + lam I) a = F* b` 用矩阵无关共轭梯度迭代求解；
+  残差、目标、正规方程残差均对最终迭代点**显式重算**，不取自 CG 递推量。
+- 重复观测作为重复测量保留，残差与目标中各计一次，不去重、不改权重。
+- 观测数可以少于未知量数（`lam>0` 保证正规方程正定）；空观测列表得到
+  零孔径，全 `False` mask 得到零孔径且残差恰为 `−b`。
+
+### 失败示例（真实触发）
+
+```python
+inv.invert_aperture(mask, observations, 10e-6, 0.5e-6, 0.10, 0.0)
+# ValueError: lam must be > 0, got 0.0     —— lam=0 时欠定正规方程奇异
+
+inv.invert_aperture(mask, observations, 10e-6, 0.5e-6, 0.10, 1e-6, max_iter=1)
+# converged=False, stop_reason='max_iter_reached' —— 上限到达不当作收敛
+```
+
+`demo_inverse.py` 现场合成观测（独立暴力求和，非被测算子）、反演并重新
+投影，打印上述两类失败边界。
+
+### 正则解不是唯一真实孔径
+
+欠采样时数据不能唯一确定孔径；`lam>0` 在拟合与能量之间折中，返回的是
+**最小（残差+lam·能量）孔径**——与数据相容的无穷多孔径之一，而非"那个"
+真实孔径。`demo_inverse.py` 用真实输出展示恢复孔径与合成真值的偏差。
+本库不做强度相位恢复（phase retrieval），观测必须含复振幅（幅度+相位）。
+
+### 逆问题错误语义
+
+- `TypeError`：mask 元素不是严格 `bool`；观测不是 `(x, y, amplitude)` 三元
+  组或振幅不是数值；`max_iter` 不是严格 `int`（`bool` 同样拒绝）。
+- `ValueError`：`lam ≤ 0`、NaN/Inf；观测坐标为 NaN/Inf；mask 非方、为空、
+  N>32；`tol ≤ 0`；`max_iter < 1`。错误信息含可定位参数名
+  （如 `observations[0]`、`mask[i][j]`、`lam`）。
+
 ## 错误语义（非法输入不静默纠正）
 
 - `TypeError`：物理量不是实数（`bool` 按数值传入同样拒绝）；`n` / `pad` 不是
@@ -104,6 +189,12 @@ rectangular_aperture(n, width, height, dx)
 暴力 O(n²) DFT、矩形孔有限等比级数闭式解、手工 Parseval 求和。被测核心从不参与
 生成期望值；正反 DFT 往返仅作为补充一致性测试。
 
+`tests/test_inverse_aperture.py` 的期望值同样来自文件内独立实现：逐项构造的
+显式稠密傅里叶矩阵 + 复数高斯消元解正规方程、手工复内积。伴随一致性
+（`<Fx, r> == <x, F*r>`，标准复内积）、小孔径显式矩阵比对、不完整采样、
+零观测、空 mask、不同 lambda、重复观测保留、迭代上限不算收敛均有覆盖；
+与正向模型在网格点上的一致性、满采样恢复仅作为补充。
+
 覆盖：自研 DFT 定义一致性、单像元常强度与线性相位、矩形孔离散解析式、圆孔确定性
 与对称性、Parseval 独立核功率、零填充功率不变与间距更新、相位斜坡导致的整数像元
 平移（移位定理）、奇偶网格 fftshift 坐标约定、全部错误语义。
@@ -125,3 +216,7 @@ rectangular_aperture(n, width, height, dx)
 - 64 点素数回退路径只在非 2/3 因子长度出现（如 M 为素数，最大为 61），仍为
   O(n²)，在本题规模下耗时以毫秒计。
 - 坐标与强度单位假定全部输入以米给出，库内不做单位换算。
+- 逆问题只解 Tikhonov 正则的线性最小二乘；不处理观测噪声建模、lam 自动
+  选取、非负/稀疏约束，也不做仅强度观测的相位恢复。CG 收敛速度依赖观测
+  几何，病态几何时可能在迭代上限内达不到 tol（此时如实报告
+  `max_iter_reached`）。
