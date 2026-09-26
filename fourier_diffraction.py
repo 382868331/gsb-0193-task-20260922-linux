@@ -1,4 +1,4 @@
-"""Fourier-diffraction sampling of complex apertures (Fraunhofer model).
+"""Fourier-diffraction sampling of complex apertures (Fraunhofer + Fresnel).
 
 Fixed contract (see README.md for the full specification):
 
@@ -365,4 +365,172 @@ def fraunhofer(aperture, dx, wavelength, z, pad: int | None = None) -> Fraunhofe
         power_error=power_error,
         n=n,
         m=m,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fresnel finite-distance propagation (fixed discrete convolution kernel)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FresnelResult:
+    """Finite-distance Fresnel propagation result (same window in and out).
+
+    intensity / field: |U|**2 and U as N lists of N, centered layout;
+    intensity[i][j] belongs to coordinate (x[i], y[j]).
+    x, y: physical coordinates (m), identical to the input window,
+    x[p] = (p - N//2) * dx.  dx: shared sample pitch (m).
+    center: index (N//2, N//2) of the zero coordinate.
+    input_power / output_power: dx**2 * sum |.|**2 of A and of U.
+    power_error: signed relative power discrepancy; 0.0 for zero input.
+    Unlike the Fraunhofer Parseval figure this is not pure round-off:
+    energy the discrete model spreads beyond the finite window is
+    genuinely lost, so it also reports window truncation.
+    n: aperture side length.  z: signed distance actually used (m).
+    """
+
+    intensity: list[list[float]]
+    field: list[list[complex]]
+    x: list[float]
+    y: list[float]
+    dx: float
+    center: tuple[int, int]
+    input_power: float
+    output_power: float
+    power_error: float
+    n: int
+    z: float
+
+
+def _fresnel_kernel_line(n, dx, wavelength, z):
+    """Unshifted 2N-point chirp line for the linear convolution.
+
+    Entry t holds exp(i pi (d*dx)**2 / (wavelength*z)) with d = t for
+    t < n and d = t - 2n otherwise, so a 2N-point circular convolution
+    reproduces the linear one for offsets -(n-1) .. n-1.
+    """
+    m = 2 * n
+    line = [0j] * m
+    for t in range(m):
+        d = t if t < n else t - m
+        phase = math.pi * (d * dx) ** 2 / (wavelength * z)
+        line[t] = cmath.exp(1j * phase)
+    return line
+
+
+def _fresnel_conv1(a, kernel_spectrum):
+    """Convolve the length-N line a with the chirp via the shared DFT."""
+    n = len(a)
+    m = 2 * n
+    padded = list(a) + [0j] * n
+    spec = _dft1(padded, -1)
+    product = [s * k for s, k in zip(spec, kernel_spectrum)]
+    conv = _dft1(product, +1)
+    return [conv[p] / m for p in range(n)]
+    return [conv[p] / m for p in range(n)]
+
+
+def fresnel(aperture, dx, wavelength, z) -> FresnelResult:
+    """Propagate a complex aperture by a finite signed distance (Fresnel).
+
+    Fixed discrete model (separable convolution, same window in and out):
+
+        U[p, q] = dx**2 / (i * wavelength * z)
+                  * sum_{t,u} A[t, u]
+                    * exp(i pi (((p-t)dx)**2 + ((q-u)dx)**2) / (wavelength z))
+
+    computed as one 1-D convolution per row and per column through the
+    module's own DFT with 2N zero padding.  The constant global phase
+    exp(i k z) is omitted (no observable intensity); the z-dependent
+    normalization dx**2 / (i * wavelength * z) is kept.
+
+    aperture: N x N complex-amplitude array, 1 <= N <= 32, centered
+    layout.  dx: sample pitch (m, finite, > 0), identical in both
+    planes.  wavelength: (m, finite, > 0).  z: signed distance (m,
+    finite real); negative propagates backwards (conjugate kernel);
+    z == 0 returns a copy of the input instead of dividing by zero.
+
+    Raises TypeError for wrong types (booleans rejected) and ValueError
+    for NaN / infinity, non-positive dx / wavelength, or bad shapes;
+    messages name the offending parameter.
+    """
+    a = _parse_aperture(aperture)
+    n = len(a)
+    dx = _finite_real(dx, "dx", positive=True)
+    wavelength = _finite_real(wavelength, "wavelength", positive=True)
+    if isinstance(z, bool) or not isinstance(z, (int, float)):
+        raise TypeError(f"z must be a real number, got {type(z).__name__}: {z!r}")
+    z = float(z)
+    if math.isnan(z) or math.isinf(z):
+        raise ValueError(f"z must be finite, got {z!r}")
+
+    input_power = 0.0
+    for row in a:
+        for v in row:
+            input_power += v.real * v.real + v.imag * v.imag
+    input_power *= dx * dx
+
+    coords = [(p - n // 2) * dx for p in range(n)]
+    center = (n // 2, n // 2)
+
+    if z == 0.0:
+        # Degenerate distance: no propagation, no division by zero.
+        field = [list(row) for row in a]
+        intensity = [[v.real * v.real + v.imag * v.imag for v in row] for row in a]
+        return FresnelResult(
+            intensity=intensity,
+            field=field,
+            x=coords,
+            y=list(coords),
+            dx=dx,
+            center=center,
+            input_power=input_power,
+            output_power=input_power,
+            power_error=0.0,
+            n=n,
+            z=0.0,
+        )
+
+    kernel = _fresnel_kernel_line(n, dx, wavelength, z)
+    kernel_spectrum = _dft1(kernel, -1)
+
+    # Separable 2-D convolution: rows first, then columns of the result.
+    row_convolved = [_fresnel_conv1(row, kernel_spectrum) for row in a]
+    field = [[0j] * n for _ in range(n)]
+    for j in range(n):
+        col = [row_convolved[i][j] for i in range(n)]
+        out = _fresnel_conv1(col, kernel_spectrum)
+        for i in range(n):
+            field[i][j] = out[i]
+
+    scale = dx * dx / (1j * wavelength * z)
+    intensity = [[0.0] * n for _ in range(n)]
+    output_power = 0.0
+    for i in range(n):
+        for j in range(n):
+            u = scale * field[i][j]
+            field[i][j] = u
+            inten = u.real * u.real + u.imag * u.imag
+            intensity[i][j] = inten
+            output_power += inten
+    output_power *= dx * dx
+
+    if input_power == 0.0:
+        power_error = 0.0
+    else:
+        power_error = (output_power - input_power) / input_power
+
+    return FresnelResult(
+        intensity=intensity,
+        field=field,
+        x=coords,
+        y=list(coords),
+        dx=dx,
+        center=center,
+        input_power=input_power,
+        output_power=output_power,
+        power_error=power_error,
+        n=n,
+        z=z,
     )
