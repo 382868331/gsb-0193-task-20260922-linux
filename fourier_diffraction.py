@@ -1,4 +1,8 @@
-"""Fourier-diffraction sampling of complex apertures (Fraunhofer model).
+"""Fourier-diffraction sampling of complex apertures.
+
+Two fixed models share one self-written DFT core:
+
+Fraunhofer (far field), see "fraunhofer":
 
 Fixed contract (see README.md for the full specification):
 
@@ -24,6 +28,26 @@ Fixed contract (see README.md for the full specification):
 
 No third-party numerical library is used; the DFT is a self-written
 mixed-radix Cooley-Tukey transform with an O(n**2) fallback for prime lengths.
+
+Fresnel (finite distance), see "fresnel":
+
+* Same centered N x N input contract.  The discrete model is the Fresnel
+  *transfer function* applied to the unnormalised DFT spectrum,
+
+      H[k, l] = exp(-i pi lambda z (fx_k**2 + fy_l**2))
+      fx_k    = ((k + N//2) mod N - N//2) / (N * dx)
+
+  which is separable, H[k, l] = h[k] * h[l], and is applied through the
+  existing 1-D transforms (row/column DFT, pointwise multiply, inverse).
+  The output window equals the input window: du = dx, coordinates
+  x[p] = (p - N//2) * dx.
+* |H| = 1 on every bin, so discrete Parseval energy is conserved exactly
+  (up to round-off): dx**2 * sum|U|**2 == dx**2 * sum|A|**2.
+* z may be positive or negative (back-propagation); z == 0 returns a copy
+  of the input field directly instead of dividing by zero.
+* The complex-amplitude normalisation is the unit-modulus transfer function
+  above with the unnormalised-forward / 1/N**2-inverse DFT pair; the global
+  carrier phase exp(i k z) is omitted, exactly like the Fraunhofer entry.
 """
 
 from __future__ import annotations
@@ -81,6 +105,46 @@ class FraunhoferResult:
     power_error: float
     n: int
     m: int
+
+
+@dataclass(frozen=True)
+class FresnelResult:
+    """Finite-distance Fresnel propagation result.
+
+    Attributes
+    ----------
+    intensity:
+        |U|**2 as N lists of N floats, centered layout.
+    field:
+        Centered complex field U on the *same* sampling window as the
+        input aperture.
+    x, y:
+        Physical coordinates (metres), x[p] = (p - N//2) * dx.
+    du:
+        Output sample pitch; always equal to the input dx.
+    center:
+        Index (N // 2, N // 2) of the zero coordinate.
+    input_power, output_power, power_error:
+        Same convention as FraunhoferResult; because the transfer function
+        has unit modulus, Parseval makes power_error pure floating-point
+        round-off (0.0 for zero input or z == 0).
+    n:
+        Aperture side length.
+    z:
+        Signed propagation distance actually used (metres).
+    """
+
+    intensity: list[list[float]]
+    field: list[list[complex]]
+    x: list[float]
+    y: list[float]
+    du: float
+    center: tuple[int, int]
+    input_power: float
+    output_power: float
+    power_error: float
+    n: int
+    z: float
 
 
 # ---------------------------------------------------------------------------
@@ -365,4 +429,156 @@ def fraunhofer(aperture, dx, wavelength, z, pad: int | None = None) -> Fraunhofe
         power_error=power_error,
         n=n,
         m=m,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fresnel finite-distance propagation
+# ---------------------------------------------------------------------------
+
+
+def _idft2(a: list[list[complex]]) -> list[list[complex]]:
+    """Inverse 2-D DFT of the unnormalised forward transform, scale 1/n**2."""
+    n = len(a)
+    rows = [_dft1(row, +1) for row in a]
+    out = [[0j] * n for _ in range(n)]
+    for j in range(n):
+        col = [rows[i][j] for i in range(n)]
+        spec = _dft1(col, +1)
+        for i in range(n):
+            out[i][j] = spec[i]
+    inv = 1.0 / (n * n)
+    return [[v * inv for v in row] for row in out]
+
+
+def fresnel(aperture, dx, wavelength, z) -> FresnelResult:
+    """Propagate a complex aperture over a finite signed distance (Fresnel).
+
+    Fixed discrete model (Fresnel transfer function on the DFT grid):
+
+        U = IDFT[ DFT[A_unshifted] * H ],
+        H[k, l] = exp(-i pi wavelength z (fx_k**2 + fy_l**2)),
+        fx_k    = ((k + N//2) mod N - N//2) / (N * dx)
+
+    H is separable (H[k, l] = h[k] h[l]) and is applied through the existing
+    1-D transforms.  The output window is the input window (du = dx).
+    |H| = 1, so discrete Parseval energy is conserved up to round-off.
+    The global carrier phase exp(i 2 pi z / wavelength) is omitted.
+
+    Parameters
+    ----------
+    aperture:
+        N x N iterable of iterables of int | float | complex, 1 <= N <= 32,
+        centered layout.  NaN / infinite elements are rejected.
+    dx:
+        Sample pitch in metres (finite, > 0); also the output pitch.
+    wavelength:
+        Optical wavelength in metres (finite, > 0).
+    z:
+        Signed propagation distance in metres (finite real; negative means
+        back-propagation).  z == 0 returns a copy of the input field
+        directly instead of dividing by zero.
+
+    Returns
+    -------
+    FresnelResult
+
+    Raises
+    ------
+    TypeError
+        Wrong parameter types; booleans are rejected wherever an int or a
+        number is expected.
+    ValueError
+        NaN / infinity, non-positive dx / wavelength, bad shapes or bounds.
+        The offending parameter name (or aperture[i][j]) is in the message.
+    """
+    a_centered = _parse_aperture(aperture)
+    n = len(a_centered)
+    dx = _finite_real(dx, 'dx', positive=True)
+    wavelength = _finite_real(wavelength, 'wavelength', positive=True)
+    z = _finite_real(z, 'z')  # sign is free; zero is handled below
+
+    coords = [(p - n // 2) * dx for p in range(n)]
+    input_power = 0.0
+    for row in a_centered:
+        for v in row:
+            input_power += v.real * v.real + v.imag * v.imag
+    input_power *= dx * dx
+
+    if z == 0.0:
+        # Identity plane: hand the input back, never divide by zero.
+        field = [[complex(v) for v in row] for row in a_centered]
+        intensity = [[v.real * v.real + v.imag * v.imag for v in row] for row in field]
+        return FresnelResult(
+            intensity=intensity,
+            field=field,
+            x=coords,
+            y=list(coords),
+            du=dx,
+            center=(n // 2, n // 2),
+            input_power=input_power,
+            output_power=input_power,
+            power_error=0.0,
+            n=n,
+            z=z,
+        )
+
+    # Centered -> unshifted (DFT) indices, same mod mapping as fraunhofer.
+    unshifted = [[0j] * n for _ in range(n)]
+    for i in range(n):
+        mi = (i - n // 2) % n
+        for j in range(n):
+            mj = (j - n // 2) % n
+            unshifted[mi][mj] = a_centered[i][j]
+
+    spectrum = _dft2(unshifted)
+
+    # Separable Fresnel transfer function on centered frequency bins.
+    h = [
+        cmath.exp(
+            -1j * math.pi * wavelength * z
+            * (((k + n // 2) % n - n // 2) / (n * dx)) ** 2
+        )
+        for k in range(n)
+    ]
+    for k in range(n):
+        hk = h[k]
+        row = spectrum[k]
+        for l in range(n):
+            row[l] *= hk * h[l]
+
+    propagated = _idft2(spectrum)
+
+    # Unshifted -> centered layout; accumulate output power.
+    field: list[list[complex]] = [[0j] * n for _ in range(n)]
+    intensity: list[list[float]] = [[0.0] * n for _ in range(n)]
+    output_power = 0.0
+    for k in range(n):
+        pi = (k + n // 2) % n
+        for l in range(n):
+            pj = (l + n // 2) % n
+            u = propagated[k][l]
+            field[pi][pj] = u
+            inten = u.real * u.real + u.imag * u.imag
+            intensity[pi][pj] = inten
+            output_power += inten
+    output_power *= dx * dx
+
+    if input_power == 0.0:
+        power_error = 0.0
+    else:
+        power_error = (output_power - input_power) / input_power
+
+    return FresnelResult(
+        intensity=intensity,
+        field=field,
+        x=coords,
+        y=list(coords),
+        du=dx,
+        center=(n // 2, n // 2),
+        input_power=input_power,
+        output_power=output_power,
+        power_error=power_error,
+        n=n,
+        z=z,
     )
