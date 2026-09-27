@@ -304,6 +304,105 @@ class TestPhaseRampShift(unittest.TestCase):
         self.assertLess(abs(r1.field[p][q] - want), 1e-12 * abs(scale * 20))
 
 
+class TestPixelEnergyIntegration(unittest.TestCase):
+    def test_single_pixel_aperture_integrates_constant_area(self):
+        r = fd.fraunhofer([[1.0]], 1.0, 1.0, 1.0, pad=8)
+        energies = fd.integrate_pixel_energies(
+            r, tolerance=1e-12, min_subdivisions=2, max_subdivisions=8
+        )
+        expected = r.du * r.du
+        self.assertTrue(energies.all_converged)
+        self.assertTrue(max(max(row) for row in energies.subdivisions) <= 8)
+        for row in energies.energy:
+            for value in row:
+                self.assertAlmostEqual(value, expected, delta=1e-18)
+
+    def test_area_integral_matches_independent_sinc_reference(self):
+        n, m = 2, 8
+        dx, wavelength, z = 1.0, 1.0, 1.0
+        aperture = [[0.0] * n for _ in range(n)]
+        aperture[0][n // 2] = 1.0
+        aperture[1][n // 2] = 1.0
+        r = fd.fraunhofer(aperture, dx, wavelength, z, pad=32)
+        result = fd.integrate_pixel_energies(
+            r, tolerance=1e-3, min_subdivisions=4, max_subdivisions=8
+        )
+
+        field_scale = dx * dx / (wavelength * z)
+        argument = math.pi * dx * r.du / (wavelength * z)
+        expected_center = (
+            2.0
+            * field_scale**2
+            * r.du**2
+            * (1.0 + math.sin(argument) / argument)
+        )
+        ci, cj = r.center
+        self.assertTrue(result.converged[ci][cj])
+        self.assertLess(
+            abs(result.energy[ci][cj] - expected_center) / expected_center,
+            2e-5,
+        )
+        self.assertNotAlmostEqual(
+            result.energy[ci][cj],
+            r.intensity[ci][cj] * r.du**2,
+            delta=1e-7 * expected_center,
+        )
+
+    def test_region_matches_sum_of_tiled_pixels_at_same_refinement(self):
+        r = fd.fraunhofer(
+            fd.rectangular_aperture(8, 3.0, 5.0, 1.0),
+            1.0,
+            1.0,
+            1.0,
+            pad=32,
+        )
+        pixels = fd.integrate_pixel_energies(
+            r, tolerance=1e-2, min_subdivisions=4, max_subdivisions=8
+        )
+        region = fd.integrate_region_energy(
+            r, 14, 18, 14, 19, tolerance=1e-2,
+            min_subdivisions=4, max_subdivisions=8,
+        )
+        tiled = math.fsum(
+            pixels.energy[i][j]
+            for i in range(14, 18)
+            for j in range(14, 19)
+        )
+        self.assertTrue(
+            all(
+                pixels.converged[i][j]
+                for i in range(14, 18)
+                for j in range(14, 19)
+            )
+        )
+        self.assertTrue(region.converged)
+        self.assertLess(region.consistency_error, 1e-14)
+        self.assertLess(abs(region.energy - tiled), 1e-14 * max(tiled, 1.0))
+
+    def test_unconverged_result_is_explicit(self):
+        r = fd.fraunhofer(
+            fd.rectangular_aperture(12, 5.0, 7.0, 1.0),
+            1.0,
+            1.0,
+            1.0,
+            pad=16,
+        )
+        result = fd.integrate_pixel_energies(
+            r, tolerance=1e-14, min_subdivisions=2, max_subdivisions=2
+        )
+        self.assertFalse(result.all_converged)
+        self.assertTrue(any(not value for row in result.converged for value in row))
+
+    def test_reject_invalid_refinement_and_region(self):
+        r = fd.fraunhofer([[1.0]], 1.0, 1.0, 1.0, pad=4)
+        with self.assertRaises(ValueError):
+            fd.integrate_pixel_energies(r, min_subdivisions=3, max_subdivisions=8)
+        with self.assertRaises(ValueError):
+            fd.integrate_region_energy(r, 1, 1, 0, 2)
+        with self.assertRaises(ValueError):
+            fd.integrate_region_energy(r, 0, 5, 0, 2)
+
+
 # ---------------------------------------------------------------------------
 # Coordinates, center index and even-grid fftshift convention
 # ---------------------------------------------------------------------------

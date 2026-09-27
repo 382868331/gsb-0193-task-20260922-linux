@@ -1,9 +1,10 @@
 # 复杂孔径的傅里叶衍射采样（Fraunhofer 模型）
 
 纯 Python 标准库实现的可复用离线模块：对 ≤32×32 的复振幅孔径做二维离散傅里叶
-变换得到远场，返回强度、物理坐标、总功率误差与中心索引；支持确定性圆孔 / 矩形孔
-生成与居中零填充（≤64×64）。**不使用任何 FFT 包或第三方数值库**，DFT 为自行实现
-的混合基 Cooley–Tukey（素数长度走 O(n²) 直接求和回退）。
+变换得到远场，返回采样点强度、有面积探测器像元的自适应积分能量、物理坐标、
+总功率误差与中心索引；支持确定性圆孔 / 矩形孔生成与居中零填充（≤64×64）。
+**不使用任何 FFT 包或第三方数值库**，DFT 为自行实现的混合基 Cooley–Tukey
+（素数长度走 O(n²) 直接求和回退）。
 
 ## 运行环境
 
@@ -15,8 +16,8 @@
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（21 个用例）
-python demo.py                            # 固定输入演示，约 0.1 秒（上限 8 秒）
+python -m unittest discover -s tests -v   # 必要测试（26 个用例）
+python demo.py                            # 固定输入演示，约 2 秒（上限 8 秒）
 ```
 
 ## 数学约定（固定契约）
@@ -44,8 +45,11 @@ python demo.py                            # 固定输入演示，约 0.1 秒（�
 
 ```python
 from fourier_diffraction import fraunhofer, circular_aperture, rectangular_aperture
+from fourier_diffraction import integrate_pixel_energies, integrate_region_energy
 
 r = fraunhofer(aperture, dx, wavelength, z, pad=None) -> FraunhoferResult
+e = integrate_pixel_energies(r, tolerance=1e-8) -> PixelEnergyResult
+block = integrate_region_energy(r, row_start, row_end, col_start, col_end) -> RegionEnergyResult
 ```
 
 - `aperture`：可迭代的可迭代行，元素为 `int | float | complex`（自动转 complex），
@@ -67,6 +71,37 @@ r = fraunhofer(aperture, dx, wavelength, z, pad=None) -> FraunhoferResult
 | `power_error` | 有符号相对功率误差（零输入为 `0.0`） |
 | `n`, `m` | 输入边长 / 变换边长 |
 
+### 有面积像元能量
+
+`intensity[i][j]` 仍是中心点采样的 `|U(x_i,y_j)|²`；不要把它直接乘 `du²` 当作
+真实探测能量。像元能量使用二维复合中点公式在像元面积内积分：
+
+```
+E[i,j] = ∫_{x_i−du/2}^{x_i+du/2} ∫_{y_j−du/2}^{y_j+du/2} |U(x,y)|² dx dy
+```
+
+- 细化顺序固定为每维 `1, 2, 4, 8, …` 个中点；默认至少检查 `4×4`，最多到
+  `32×32`，两者都必须是 2 的幂。
+- 每个像元必须在连续两级细化中同时满足 `tolerance` 与可选
+  `absolute_tolerance`，对应 `converged[i][j]` 才置为真；`all_converged` 是
+  全场是否达到请求精度的总判断。亮暗快速变化区域不会因一两个稀疏样本偶然相同
+  而过早接受。
+- `relative_error[i][j]` 保存最近一次相邻细化等级的相对变化；未收敛时不得把
+  返回能量宣称为达到请求精度，应提高 `max_subdivisions`、增大容差或检查物理网格。
+- 所有亚像元点通过对同一孔径做更密零填充 DFT 得到，而不是调用 FFT 包或用解析
+  拟合；能量权重为小中点单元面积 `(du/q)²`。
+- `integrate_region_energy` 对半开矩形区域
+  `[row_start,row_end) × [col_start,col_end)` 积分。
+  `pixel_energy_sum` 是同一细化网格上所选相邻像元能量之和，
+  `consistency_error` 用于核对“相邻像元合起来”与“同一总区域直接积分”。
+
+`PixelEnergyResult` 字段：`energy`、`relative_error`、`subdivisions`、
+`converged`、`all_converged`、`tolerance`、`absolute_tolerance`、
+`min_subdivisions`、`max_subdivisions`。
+
+`RegionEnergyResult` 额外包含区域边界、区域 `relative_error` /
+`converged`、`pixel_energy_sum` 与 `consistency_error`。
+
 确定性孔径生成（均为纯函数，输出 `float` 的 0.0/1.0）：
 
 ```python
@@ -82,10 +117,12 @@ rectangular_aperture(n, width, height, dx)
   严格 `int`（**`bool` 即使是 `int` 子类也拒绝**）；孔径元素不是数值；孔径不可
   迭代或行不可迭代。
 - `ValueError`：任何实数 / 复数元素为 `NaN` 或 `±Infinity`；`dx/wavelength/z ≤ 0`；
-  `radius/width/height < 0`；空阵、非矩形、非方阵；N<1、N>32、M<N、M>64。
+  `radius/width/height < 0`；空阵、非矩形、非方阵；N<1、N>32、M<N、M>64；
+  积分容差为负，或细分数不是 1–64 内的 2 的幂 / 上下限顺序错误；积分区域越界或为空。
 - 错误信息包含**可定位参数名**（如 `wavelength` 或 `aperture[i][j]`）。
-- 计算为纯函数，无批次 / 有状态写操作，因此不存在部分变更；不存在搜索类算法，
-  故无“预算耗尽”与“证明无解”之分（本契约的失败模式只有上面的参数拒绝）。
+- 计算为纯函数，无批次 / 有状态写操作。自适应积分达到最大细分但未满足容差时不抛
+  异常，而是通过逐像元或区域 `converged=False` 明确报告精度未达成；非法容差 /
+  细分参数仍立即抛出 `TypeError` 或 `ValueError`。
 
 ## 浮点误差口径（不以宽容差掩盖边界错误）
 
@@ -96,6 +133,8 @@ rectangular_aperture(n, width, height, dx)
   测试判据为 **1e-12**（这是纯累加舍入，不包含任何近似模型误差）。
 - 矩形孔远场与**离散解析式**（有限等比级数闭式解，非 DFT 计算）逐像元比较
   < 1e-12（按全场最大幅值归一）；单像元常强度用精确相等 / 1e-15 判据。
+- 有面积能量用独立一维积分解析式（`1 ± sinc` 形式）核对中心像元；区域测试同时
+  检查区域直接积分、相邻像元求和及 `consistency_error`。
 - 坐标为整数倍 `du`，用 `1e-20` 绝对判据核对；DC 像元坐标严格为 `0.0`。
 
 ## 测试的独立性
@@ -106,7 +145,8 @@ rectangular_aperture(n, width, height, dx)
 
 覆盖：自研 DFT 定义一致性、单像元常强度与线性相位、矩形孔离散解析式、圆孔确定性
 与对称性、Parseval 独立核功率、零填充功率不变与间距更新、相位斜坡导致的整数像元
-平移（移位定理）、奇偶网格 fftshift 坐标约定、全部错误语义。
+平移（移位定理）、奇偶网格 fftshift 坐标约定、面积积分自适应收敛 / 未达标报告、
+相邻像元与同区域积分互核、全部错误语义。
 
 ## 设计取舍
 

@@ -38,6 +38,64 @@ MAX_PADDED = 64
 
 
 @dataclass(frozen=True)
+class PixelEnergyResult:
+    """Adaptive area-integrated detector-pixel energies.
+
+    Attributes
+    ----------
+    energy:
+        M x M integrated energy
+        ``integral integral |U(x, y)|**2 dx dy`` over each detector pixel.
+    relative_error:
+        Latest accepted relative change for each pixel.  The absolute error
+        estimate is ``relative_error[i][j] * max(|energy_new|,
+        |energy_previous|)``.
+    subdivisions:
+        Number of midpoint subdivisions per axis used for each final estimate.
+    converged:
+        Per-pixel convergence flag.
+    all_converged:
+        True only when every pixel met the requested tolerance.
+    tolerance:
+        Requested relative tolerance.
+    absolute_tolerance:
+        Requested absolute energy tolerance.
+    min_subdivisions, max_subdivisions:
+        Refinement bounds used by the integrator.
+    """
+
+    energy: list[list[float]]
+    relative_error: list[list[float]]
+    subdivisions: list[list[int]]
+    converged: list[list[bool]]
+    all_converged: bool
+    tolerance: float
+    absolute_tolerance: float
+    min_subdivisions: int
+    max_subdivisions: int
+
+
+@dataclass(frozen=True)
+class RegionEnergyResult:
+    """Adaptive integral over a rectangular union of detector pixels."""
+
+    energy: float
+    relative_error: float
+    subdivisions: int
+    converged: bool
+    pixel_energy_sum: float
+    consistency_error: float
+    row_start: int
+    row_end: int
+    col_start: int
+    col_end: int
+    tolerance: float
+    absolute_tolerance: float
+    min_subdivisions: int
+    max_subdivisions: int
+
+
+@dataclass(frozen=True)
 class FraunhoferResult:
     """Far-field result.
 
@@ -68,6 +126,11 @@ class FraunhoferResult:
         Input aperture side length.
     m:
         (Possibly padded) transform side length.
+    aperture:
+        Parsed centered input aperture, retained for continuous-area
+        integration.
+    dx, wavelength, z:
+        Physical propagation parameters used to generate this result.
     """
 
     intensity: list[list[float]]
@@ -81,6 +144,10 @@ class FraunhoferResult:
     power_error: float
     n: int
     m: int
+    aperture: list[list[complex]]
+    dx: float
+    wavelength: float
+    z: float
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +280,269 @@ def _dft2(a: list[list[complex]]) -> list[list[complex]]:
         for i in range(m):
             out[i][j] = spec[i]
     return out
+
+
+def _validate_refinement(
+    min_subdivisions: int,
+    max_subdivisions: int,
+    *,
+    name: str = "subdivisions",
+) -> tuple[int, int]:
+    lo = _strict_int(min_subdivisions, f"min_{name}", lo=1, hi=64)
+    hi = _strict_int(max_subdivisions, f"max_{name}", lo=1, hi=64)
+    if lo & (lo - 1):
+        raise ValueError(f"min_{name} must be a power of two, got {lo}")
+    if hi & (hi - 1):
+        raise ValueError(f"max_{name} must be a power of two, got {hi}")
+    if hi < lo:
+        raise ValueError(
+            f"max_{name} must be >= min_{name}, got {hi} < {lo}"
+        )
+    return lo, hi
+
+
+def _pixel_midpoint_energies(
+    aperture: list[list[complex]],
+    transform_size: int,
+    dx: float,
+    wavelength: float,
+    z: float,
+    subdivisions: int,
+) -> list[list[float]]:
+    """Composite midpoint energy for all detector pixels at one refinement."""
+    n = len(aperture)
+    m = transform_size
+    q = subdivisions
+    # A 2*q*m transform gives output samples on a half-pixel-spaced grid, so
+    # every pixel's q midpoint points can be selected without phase shifting.
+    fine_m = 2 * q * m
+    source = [[0j] * fine_m for _ in range(fine_m)]
+    for i in range(n):
+        si = (i - n // 2) % fine_m
+        for j in range(n):
+            sj = (j - n // 2) % fine_m
+            source[si][sj] = aperture[i][j]
+
+    spectrum = _dft2(source)
+    field_scale = dx * dx / (wavelength * z)
+    du = wavelength * z / (m * dx)
+    cell_area = (du / q) ** 2
+    energies = [[0.0] * m for _ in range(m)]
+
+    for i in range(m):
+        for j in range(m):
+            total = 0.0
+            for ti in range(q):
+                ri = (
+                    2 * q * (i - m // 2) + 2 * ti - q + 1
+                ) % fine_m
+                for tj in range(q):
+                    rj = (
+                        2 * q * (j - m // 2) + 2 * tj - q + 1
+                    ) % fine_m
+                    value = field_scale * spectrum[ri][rj]
+                    total += value.real * value.real + value.imag * value.imag
+            energies[i][j] = total * cell_area
+    return energies
+
+
+def _relative_change(previous: list[list[float]], current: list[list[float]]) -> list[list[float]]:
+    out = [[0.0] * len(current) for _ in current]
+    for i, row in enumerate(current):
+        for j, value in enumerate(row):
+            scale = max(abs(value), abs(previous[i][j]))
+            out[i][j] = abs(value - previous[i][j]) / scale if scale else 0.0
+    return out
+
+
+def integrate_pixel_energies(
+    result: FraunhoferResult,
+    tolerance: float = 1e-8,
+    absolute_tolerance: float = 0.0,
+    min_subdivisions: int = 4,
+    max_subdivisions: int = 32,
+) -> PixelEnergyResult:
+    """Integrate ``|U|**2`` over finite detector-pixel areas.
+
+    The composite 2-D midpoint rule is refined as 1, 2, 4, ... samples per
+    pixel axis.  A pixel is accepted only after two successive refinements
+    satisfy both the relative and absolute error estimates; the first checked
+    level is ``min_subdivisions``.
+    """
+    if not isinstance(result, FraunhoferResult):
+        raise TypeError(
+            "result must be a FraunhoferResult, got "
+            f"{type(result).__name__}"
+        )
+    tolerance = _finite_real(tolerance, "tolerance", nonneg=True)
+    absolute_tolerance = _finite_real(
+        absolute_tolerance, "absolute_tolerance", nonneg=True
+    )
+    lo, hi = _validate_refinement(min_subdivisions, max_subdivisions)
+
+    m = result.m
+    previous = [[0.0] * m for _ in range(m)]
+    current = [[0.0] * m for _ in range(m)]
+    errors = [[0.0] * m for _ in range(m)]
+    last_errors = [[float("inf")] * m for _ in range(m)]
+    used = [[0] * m for _ in range(m)]
+    accepted = [[False] * m for _ in range(m)]
+    stable = [[False] * m for _ in range(m)]
+    q = 1
+
+    while q <= hi:
+        current = _pixel_midpoint_energies(
+            result.aperture,
+            m,
+            result.dx,
+            result.wavelength,
+            result.z,
+            q,
+        )
+        if q >= lo:
+            new_errors = _relative_change(previous, current)
+            for i in range(m):
+                for j in range(m):
+                    absolute_change = abs(current[i][j] - previous[i][j])
+                    passes = (
+                        new_errors[i][j] <= tolerance
+                        and absolute_change <= absolute_tolerance
+                    ) if absolute_tolerance > 0.0 else new_errors[i][j] <= tolerance
+                    if passes and stable[i][j]:
+                        accepted[i][j] = True
+                        errors[i][j] = new_errors[i][j]
+                        used[i][j] = q
+                    stable[i][j] = passes
+                    last_errors[i][j] = new_errors[i][j]
+        previous = current
+        if all(all(row) for row in accepted):
+            break
+        q *= 2
+
+    for i in range(m):
+        for j in range(m):
+            if not accepted[i][j]:
+                errors[i][j] = last_errors[i][j]
+                used[i][j] = hi
+
+    return PixelEnergyResult(
+        energy=current,
+        relative_error=errors,
+        subdivisions=used,
+        converged=accepted,
+        all_converged=all(all(row) for row in accepted),
+        tolerance=tolerance,
+        absolute_tolerance=absolute_tolerance,
+        min_subdivisions=lo,
+        max_subdivisions=hi,
+    )
+
+
+def integrate_region_energy(
+    result: FraunhoferResult,
+    row_start: int,
+    row_end: int,
+    col_start: int,
+    col_end: int,
+    tolerance: float = 1e-8,
+    absolute_tolerance: float = 0.0,
+    min_subdivisions: int = 4,
+    max_subdivisions: int = 16,
+) -> RegionEnergyResult:
+    """Integrate one rectangular, half-open union ``[r0, r1) x [c0, c1)``.
+
+    The region estimate uses the same physical midpoint samples as the pixel
+    integrator.  ``pixel_energy_sum`` independently adds the selected final
+    per-pixel values, making detector tiling checkable against the integral
+    over the combined area.
+    """
+    if not isinstance(result, FraunhoferResult):
+        raise TypeError(
+            "result must be a FraunhoferResult, got "
+            f"{type(result).__name__}"
+        )
+    row_start = _strict_int(row_start, "row_start", lo=0, hi=result.m)
+    row_end = _strict_int(row_end, "row_end", lo=0, hi=result.m)
+    col_start = _strict_int(col_start, "col_start", lo=0, hi=result.m)
+    col_end = _strict_int(col_end, "col_end", lo=0, hi=result.m)
+    if row_end <= row_start or col_end <= col_start:
+        raise ValueError("region must contain at least one detector pixel")
+    tolerance = _finite_real(tolerance, "tolerance", nonneg=True)
+    absolute_tolerance = _finite_real(
+        absolute_tolerance, "absolute_tolerance", nonneg=True
+    )
+    lo, hi = _validate_refinement(min_subdivisions, max_subdivisions)
+
+    previous_total = 0.0
+    current_total = 0.0
+    final_grid: list[list[float]] = []
+    relative_error = float("inf")
+    used = hi
+    converged = False
+    was_stable = False
+    q = 1
+
+    while q <= hi:
+        grid = _pixel_midpoint_energies(
+            result.aperture,
+            result.m,
+            result.dx,
+            result.wavelength,
+            result.z,
+            q,
+        )
+        selected = [
+            grid[i][j]
+            for i in range(row_start, row_end)
+            for j in range(col_start, col_end)
+        ]
+        current_total = sum(selected)
+        final_grid = grid
+
+        if q >= lo:
+            scale = max(abs(current_total), abs(previous_total))
+            relative_error = (
+                abs(current_total - previous_total) / scale if scale else 0.0
+            )
+            absolute_change = abs(current_total - previous_total)
+            passes = (
+                relative_error <= tolerance
+                and absolute_change <= absolute_tolerance
+            ) if absolute_tolerance > 0.0 else relative_error <= tolerance
+            if passes and was_stable:
+                converged = True
+                used = q
+            was_stable = passes
+
+        previous_total = current_total
+        if converged:
+            break
+        q *= 2
+
+    tiled_sum = math.fsum(
+        final_grid[i][j]
+        for i in range(row_start, row_end)
+        for j in range(col_start, col_end)
+    )
+    consistency_scale = max(abs(current_total), abs(tiled_sum), 1.0)
+    consistency_error = abs(current_total - tiled_sum) / consistency_scale
+
+    return RegionEnergyResult(
+        energy=current_total,
+        relative_error=relative_error,
+        subdivisions=used,
+        converged=converged,
+        pixel_energy_sum=tiled_sum,
+        consistency_error=consistency_error,
+        row_start=row_start,
+        row_end=row_end,
+        col_start=col_start,
+        col_end=col_end,
+        tolerance=tolerance,
+        absolute_tolerance=absolute_tolerance,
+        min_subdivisions=lo,
+        max_subdivisions=hi,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -365,4 +695,8 @@ def fraunhofer(aperture, dx, wavelength, z, pad: int | None = None) -> Fraunhofe
         power_error=power_error,
         n=n,
         m=m,
+        aperture=a_centered,
+        dx=dx,
+        wavelength=wavelength,
+        z=z,
     )

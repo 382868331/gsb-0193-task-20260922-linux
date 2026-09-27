@@ -1,8 +1,8 @@
 """Fixed-input demonstration of fourier_diffraction.
 
-Runs one real Fraunhofer calculation (32x32 circular aperture, zero-padded to
-64x64) and one genuinely triggered input-rejection boundary.  No sleep, no
-network, no prerecorded results; everything is computed here and now.
+Runs one real Fraunhofer calculation (16x16 circular aperture, evaluated on a
+32x32 detector grid), integrates finite detector-pixel areas, and triggers one
+genuine input-rejection boundary.
 """
 
 import time
@@ -12,7 +12,7 @@ import fourier_diffraction as fd
 
 def main() -> None:
     # ---- Fixed physical parameters ------------------------------------------------
-    n = 32
+    n = 16
     dx = 10.0e-6          # 10 micrometre aperture-plane pitch
     wavelength = 0.5e-6   # 500 nm
     z = 0.10              # 10 cm propagation
@@ -22,7 +22,7 @@ def main() -> None:
     lit = int(sum(sum(row) for row in aperture))
 
     t0 = time.perf_counter()
-    result = fd.fraunhofer(aperture, dx, wavelength, z, pad=64)
+    result = fd.fraunhofer(aperture, dx, wavelength, z, pad=32)
     elapsed = time.perf_counter() - t0
 
     # Locate the main peak from the returned intensity grid.
@@ -56,6 +56,43 @@ def main() -> None:
     print(f"output power   : {result.output_power:.12e}")
     print(f"relative power error (Parseval check) : {result.power_error:+.3e}")
     print(f"elapsed        : {elapsed*1000:.1f} ms")
+
+    t0 = time.perf_counter()
+    energies = fd.integrate_pixel_energies(
+        result,
+        tolerance=5e-2,
+        min_subdivisions=2,
+        max_subdivisions=4,
+    )
+    block = fd.integrate_region_energy(
+        result,
+        ci,
+        ci + 2,
+        cj,
+        cj + 2,
+        tolerance=5e-2,
+        min_subdivisions=2,
+        max_subdivisions=4,
+    )
+    energy_elapsed = time.perf_counter() - t0
+    tiled = sum(
+        energies.energy[i][j]
+        for i in range(ci, ci + 2)
+        for j in range(cj, cj + 2)
+    )
+    center_area_energy = energies.energy[ci][cj]
+    center_point_proxy = result.intensity[ci][cj] * result.du**2
+    print()
+    print("=== Finite-area detector energy ===")
+    print(f"center pixel energy            : {center_area_energy:.6e} J proxy")
+    print(f"center-point * area (not used) : {center_point_proxy:.6e} J proxy")
+    print(f"center relative refinement     : {energies.relative_error[ci][cj]:.3e}")
+    print(f"center converged               : {energies.converged[ci][cj]}")
+    print(f"2x2 tiled energy               : {tiled:.6e}")
+    print(f"2x2 direct region energy       : {block.energy:.6e}")
+    print(f"tile/region consistency error  : {block.consistency_error:.3e}")
+    print(f"region converged               : {block.converged}")
+    print(f"integration elapsed            : {energy_elapsed*1000:.1f} ms")
 
     # ---- A boundary that really triggers -------------------------------------------
     print()
