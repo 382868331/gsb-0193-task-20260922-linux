@@ -63,6 +63,51 @@ def shifted_index(k, m):
     return (k + m // 2) % m
 
 
+def reference_field(aperture, dx, wavelength, z, x, y):
+    """Independent continuous Fraunhofer field: plain double sum with one
+    cmath.exp call per aperture pixel (no phasor power iteration)."""
+    n = len(aperture)
+    n0 = n // 2
+    total = 0j
+    for mi in range(n):
+        for ni in range(n):
+            v = aperture[mi][ni]
+            if v:
+                phase = -2.0 * math.pi * (
+                    x * (mi - n0) + y * (ni - n0)
+                ) * dx / (wavelength * z)
+                total += v * cmath.exp(1j * phase)
+    return total * dx * dx / (wavelength * z)
+
+
+# 5-point Gauss-Legendre on [-1, 1], literal nodes/weights.
+_REF_GL5_T = (0.0, -0.5384693101056831, 0.5384693101056831,
+              -0.9061798459386640, 0.9061798459386640)
+_REF_GL5_W = (0.5688888888888889, 0.4786286704993665, 0.4786286704993665,
+              0.2369268850561891, 0.2369268850561891)
+
+
+def reference_integral(aperture, dx, wavelength, z, x0, x1, y0, y1, cells=6):
+    """Independent fixed-grid 5x5 Gauss-Legendre quadrature: uniform split
+    into cells x cells squares, no adaptivity, different order and nodes
+    than the 3-point rule used by the module under test."""
+    hx = (x1 - x0) / cells
+    hy = (y1 - y0) / cells
+    total = 0.0
+    for cx in range(cells):
+        for cy in range(cells):
+            mx = x0 + (cx + 0.5) * hx
+            my = y0 + (cy + 0.5) * hy
+            acc = 0.0
+            for tx, wx in zip(_REF_GL5_T, _REF_GL5_W):
+                for ty, wy in zip(_REF_GL5_T, _REF_GL5_W):
+                    u = reference_field(aperture, dx, wavelength, z,
+                                        mx + 0.5 * hx * tx, my + 0.5 * hy * ty)
+                    acc += wx * wy * abs(u) ** 2
+            total += acc * 0.25 * hx * hy
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Core transform tests
 # ---------------------------------------------------------------------------
@@ -409,6 +454,221 @@ class TestErrors(unittest.TestCase):
             fd.fraunhofer([["1.0"]], 1.0, 1.0, 1.0)
         with self.assertRaises(TypeError):
             fd.fraunhofer(1.5, 1.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Pixel-energy integration
+# ---------------------------------------------------------------------------
+
+
+class TestContinuousField(unittest.TestCase):
+    def test_matches_dft_bins(self):
+        # Consistency check: the continuous field sampled at unshifted bin
+        # coordinates must reproduce the DFT-based field of fraunhofer().
+        n = 12
+        dx, wavelength, z = 1e-5, 5e-7, 0.1
+        a = [[complex((i + j) % 3 - 1, (i * j) % 2) for j in range(n)] for i in range(n)]
+        r = fd.fraunhofer(a, dx, wavelength, z)
+        scale = max(abs(v) for row in r.field for v in row)
+        for k in range(n):
+            for l in range(n):
+                u = fd._continuous_field(a, dx, wavelength, z, k * r.du, l * r.du)
+                p, q = shifted_index(k, n), shifted_index(l, n)
+                self.assertLess(abs(u - r.field[p][q]), 1e-10 * scale)
+
+    def test_matches_independent_direct_sum(self):
+        # Independent reference: plain cmath.exp double sum in this file.
+        n = 8
+        dx, wavelength, z = 2e-5, 6e-7, 0.07
+        a = fd.rectangular_aperture(n, 5 * dx, 3 * dx, dx)
+        r = fd.fraunhofer(a, dx, wavelength, z)
+        for x, y in [(0.0, 0.0), (1.3 * r.du, -2.7 * r.du), (-4.2 * r.du, 0.9 * r.du)]:
+            got = fd._continuous_field(a, dx, wavelength, z, x, y)
+            want = reference_field(a, dx, wavelength, z, x, y)
+            self.assertLess(abs(got - want), 1e-12 * max(1.0, abs(want)))
+
+
+class TestIntegrateIntensity(unittest.TestCase):
+    def test_constant_intensity_region_is_exact(self):
+        # Single centered pixel aperture: intensity is exactly scale**2
+        # everywhere, so the integral is scale**2 * area analytically.
+        n = 8
+        dx, wavelength, z = 1e-5, 5e-7, 0.1
+        a = [[0j] * n for _ in range(n)]
+        a[n // 2][n // 2] = 1.0
+        scale = dx * dx / (wavelength * z)
+        x0, x1, y0, y1 = -3.7e-4, 5.2e-4, -1.1e-4, 2.9e-4
+        r = fd.integrate_intensity(a, dx, wavelength, z, x0, x1, y0, y1)
+        want = scale * scale * (x1 - x0) * (y1 - y0)
+        self.assertTrue(r.converged)
+        self.assertLess(abs(r.energy - want), 1e-12 * want)
+        self.assertEqual(r.region, (x0, x1, y0, y1))
+
+    def test_matches_independent_fixed_quadrature(self):
+        # Speckled complex aperture; module result vs the independent
+        # fixed-grid 5-point Gauss reference in this file.
+        n = 8
+        dx, wavelength, z = 1.5e-5, 5.5e-7, 0.08
+        a = [[complex((i * 3 + j) % 3 - 1, (i + 2 * j) % 4 - 1.5) for j in range(n)]
+             for i in range(n)]
+        r0 = fd.fraunhofer(a, dx, wavelength, z)
+        x0, x1 = -2.3 * r0.du, 1.7 * r0.du
+        y0, y1 = -1.2 * r0.du, 2.6 * r0.du
+        r = fd.integrate_intensity(a, dx, wavelength, z, x0, x1, y0, y1, rtol=1e-8)
+        want = reference_integral(a, dx, wavelength, z, x0, x1, y0, y1, cells=8)
+        self.assertTrue(r.converged)
+        self.assertLess(abs(r.energy - want), 1e-7 * want)
+        self.assertLessEqual(r.error_estimate, max(1e-8 * r.energy, 1e-300) * 4)
+
+    def test_min_depth_forces_subdivision(self):
+        # Even for an exactly constant integrand the refinement must go at
+        # least min_depth levels deep: no early stop on identical samples.
+        n = 4
+        a = [[0j] * n for _ in range(n)]
+        a[n // 2][n // 2] = 1.0
+        r = fd.integrate_intensity(a, 1e-5, 5e-7, 0.1, -1e-4, 1e-4, -1e-4, 1e-4,
+                                   min_depth=3)
+        self.assertGreaterEqual(r.depth, 3)
+        self.assertGreaterEqual(r.evaluations, 9 * (1 + 4 + 16 + 64))
+
+    def test_budget_exhaustion_is_reported_not_silent(self):
+        n = 8
+        dx, wavelength, z = 1.5e-5, 5.5e-7, 0.08
+        a = [[complex((i + j) % 2, (i * j) % 3 - 1) for j in range(n)] for i in range(n)]
+        r0 = fd.fraunhofer(a, dx, wavelength, z)
+        # Absurdly tight tolerance with a tiny depth budget cannot converge.
+        r = fd.integrate_intensity(a, dx, wavelength, z,
+                                   -3 * r0.du, 3 * r0.du, -3 * r0.du, 3 * r0.du,
+                                   rtol=1e-15, max_depth=3)
+        self.assertFalse(r.converged)
+        self.assertEqual(r.depth, 3)
+        # A sane request on the same region does converge: failure above is
+        # the budget, not the integrand.
+        r2 = fd.integrate_intensity(a, dx, wavelength, z,
+                                    -3 * r0.du, 3 * r0.du, -3 * r0.du, 3 * r0.du,
+                                    rtol=1e-6)
+        self.assertTrue(r2.converged)
+
+    def test_additivity_neighbouring_regions(self):
+        # Energy of neighbouring pixels summed must match one integration
+        # over the same total rectangle (cross-check, tight tolerance).
+        n = 8
+        dx, wavelength, z = 1.5e-5, 5.5e-7, 0.08
+        a = fd.circular_aperture(n, 3 * dx, dx)
+        r0 = fd.fraunhofer(a, dx, wavelength, z, pad=16)
+        du = r0.du
+        ci, cj = r0.center
+        parts = [
+            fd.pixel_energy(a, dx, wavelength, z, ci + di, cj + dj, pad=16, rtol=1e-9)
+            for di in (0, 1) for dj in (0, 1)
+        ]
+        for p in parts:
+            self.assertTrue(p.converged)
+        summed = sum(p.energy for p in parts)
+        whole = fd.integrate_intensity(a, dx, wavelength, z,
+                                       -0.5 * du, 1.5 * du, -0.5 * du, 1.5 * du,
+                                       rtol=1e-9)
+        self.assertTrue(whole.converged)
+        self.assertLess(abs(summed - whole.energy), 1e-7 * whole.energy)
+        # And the merged region matches the independent reference.
+        want = reference_integral(a, dx, wavelength, z,
+                                  -0.5 * du, 1.5 * du, -0.5 * du, 1.5 * du, cells=8)
+        self.assertLess(abs(whole.energy - want), 1e-7 * want)
+
+
+class TestPixelEnergy(unittest.TestCase):
+    def test_region_matches_detector_pixel(self):
+        n = 8
+        dx, wavelength, z = 1e-5, 5e-7, 0.1
+        a = fd.rectangular_aperture(n, 4 * dx, 4 * dx, dx)
+        r0 = fd.fraunhofer(a, dx, wavelength, z, pad=16)
+        i, j = 9, 6
+        r = fd.pixel_energy(a, dx, wavelength, z, i, j, pad=16)
+        du = r0.du
+        x0, x1, y0, y1 = r.region
+        self.assertAlmostEqual(x0, (i - 8) * du - 0.5 * du, delta=1e-20)
+        self.assertAlmostEqual(x1, (i - 8) * du + 0.5 * du, delta=1e-20)
+        self.assertAlmostEqual(y0, (j - 8) * du - 0.5 * du, delta=1e-20)
+        self.assertAlmostEqual(y1, (j - 8) * du + 0.5 * du, delta=1e-20)
+        self.assertTrue(r.converged)
+        # Constant-integrand sanity: energy is du**2 * mean intensity > 0.
+        self.assertGreater(r.energy, 0.0)
+
+    def test_center_pixel_beats_center_times_area(self):
+        # For a peaked pattern the integrated pixel energy differs from the
+        # naive intensity*du**2 estimate, and the integral is the smaller
+        # one at the peak (intensity is convex there).
+        n = 16
+        dx, wavelength, z = 1e-5, 5e-7, 0.1
+        a = fd.circular_aperture(n, 5 * dx, dx)
+        r0 = fd.fraunhofer(a, dx, wavelength, z)
+        ci, cj = r0.center
+        r = fd.pixel_energy(a, dx, wavelength, z, ci, cj, rtol=1e-8)
+        naive = r0.intensity[ci][cj] * r0.du * r0.du
+        self.assertTrue(r.converged)
+        self.assertLess(r.energy, naive)
+        self.assertLess(abs(r.energy - naive) / naive, 0.2)
+
+    def test_energy_matches_integrate_intensity_same_region(self):
+        n = 8
+        dx, wavelength, z = 1e-5, 5e-7, 0.1
+        a = fd.circular_aperture(n, 3 * dx, dx)
+        du = wavelength * z / (n * dx)
+        i, j = 5, 2
+        r_pix = fd.pixel_energy(a, dx, wavelength, z, i, j, rtol=1e-9)
+        r_int = fd.integrate_intensity(
+            a, dx, wavelength, z,
+            (i - n // 2 - 0.5) * du, (i - n // 2 + 0.5) * du,
+            (j - n // 2 - 0.5) * du, (j - n // 2 + 0.5) * du,
+            rtol=1e-9,
+        )
+        self.assertAlmostEqual(r_pix.energy, r_int.energy, delta=1e-12 * r_int.energy)
+
+
+class TestIntegrationErrors(unittest.TestCase):
+    def test_bad_region(self):
+        a = [[1.0]]
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0)  # x0 == x1
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 2.0, 1.0, 0.0, 1.0)  # x0 > x1
+        with self.assertRaises(ValueError) as cm:
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 3.0, 2.0)  # y0 > y1
+        self.assertIn("y0", str(cm.exception))
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, float("nan"), 1.0, 0.0, 1.0)
+        with self.assertRaises(TypeError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, True, 1.0, 0.0, 1.0)
+
+    def test_bad_controls(self):
+        a = [[1.0]]
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, rtol=0.0)
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, atol=-1e-9)
+        with self.assertRaises(ValueError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+                                   min_depth=5, max_depth=3)
+        with self.assertRaises(TypeError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+                                   max_depth=True)
+        with self.assertRaises(TypeError):
+            fd.integrate_intensity(a, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+                                   max_evaluations=100.5)
+
+    def test_bad_pixel_index(self):
+        a = [[1.0, 0.0], [0.0, 0.0]]
+        with self.assertRaises(TypeError):
+            fd.pixel_energy(a, 1.0, 1.0, 1.0, True, 0)
+        with self.assertRaises(TypeError):
+            fd.pixel_energy(a, 1.0, 1.0, 1.0, 0, 1.5)
+        with self.assertRaises(ValueError) as cm:
+            fd.pixel_energy(a, 1.0, 1.0, 1.0, 2, 0)
+        self.assertIn("i", str(cm.exception))
+        with self.assertRaises(ValueError):
+            fd.pixel_energy(a, 1.0, 1.0, 1.0, 0, -1)
+        with self.assertRaises(ValueError):
+            fd.pixel_energy(a, 1.0, 1.0, 1.0, 0, 0, pad=4, max_evaluations=8)
 
 
 if __name__ == "__main__":

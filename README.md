@@ -15,8 +15,8 @@
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（21 个用例）
-python demo.py                            # 固定输入演示，约 0.1 秒（上限 8 秒）
+python -m unittest discover -s tests -v   # 必要测试（34 个用例）
+python demo.py                            # 固定输入演示，约 0.5 秒（上限 8 秒）
 ```
 
 ## 数学约定（固定契约）
@@ -67,6 +67,47 @@ r = fraunhofer(aperture, dx, wavelength, z, pad=None) -> FraunhoferResult
 | `power_error` | 有符号相对功率误差（零输入为 `0.0`） |
 | `n`, `m` | 输入边长 / 变换边长 |
 
+### 探测像素能量（面积积分）
+
+```python
+from fourier_diffraction import integrate_intensity, pixel_energy
+
+e = pixel_energy(aperture, dx, wavelength, z, i, j, pad=None,
+                 rtol=1e-6, atol=0.0, min_depth=2, max_depth=12,
+                 max_evaluations=200000) -> IntegrationResult
+e2 = integrate_intensity(aperture, dx, wavelength, z, x0, x1, y0, y1,
+                         rtol=1e-6, ...) -> IntegrationResult
+```
+
+- `pixel_energy`：采样点 `(i, j)` 对应的 `du x du` 探测像元（以
+  `((i-M//2)du, (j-M//2)du)` 为中心的方块）实际接收的能量，即连续
+  Fraunhofer 强度在像元面积上的积分，**不是** `intensity[i][j] * du**2`。
+- `integrate_intensity`：任意矩形 `[x0, x1] x [y0, y1]`（米）上的强度积分，
+  用于把相邻像素合并后与同一总区域互相核对。
+- 被积函数是**连续远场**（孔径直接求和，与 DFT bin 完全同号约定），不是对
+  采样网格的插值。
+
+`IntegrationResult`（frozen dataclass）字段：
+
+| 字段 | 含义 |
+|---|---|
+| `energy` | 区域内的强度积分（像素接收能量） |
+| `error_estimate` | 保守绝对误差估计（所有接受单元 `|Q - ΣQ子|` 之和，不做 Richardson 缩小） |
+| `converged` | 是否真正达到请求精度；预算（`max_depth`/`max_evaluations`）耗尽时为 `False`，绝不静默当作成功 |
+| `evaluations` | 实际连续场求值次数 |
+| `depth` | 实际到达的最深细分层数 |
+| `region` | 精确积分矩形 `(x0, x1, y0, y1)` |
+
+自适应积分约定（防过早停止）：
+
+- 每个单元为 3x3 张量 Gauss–Legendre；积分区域按四叉树逐步细分。
+- 所有单元**至少细分 `min_depth` 层**（默认 2）后才允许判收敛，亮暗快速
+  变化的区域不会因少量样本碰巧相同而提前停止。
+- 单元接受判据：`|Q单元 - ΣQ四子单元|` 不超过按面积比例分配的全局容差
+  `T = max(atol, rtol * Q全区域)`。
+- 不同层级的 Gauss 节点永不重合（节点为半宽的无理数倍），父/子估计使用
+  真正独立的采样点集。
+
 确定性孔径生成（均为纯函数，输出 `float` 的 0.0/1.0）：
 
 ```python
@@ -83,9 +124,14 @@ rectangular_aperture(n, width, height, dx)
   迭代或行不可迭代。
 - `ValueError`：任何实数 / 复数元素为 `NaN` 或 `±Infinity`；`dx/wavelength/z ≤ 0`；
   `radius/width/height < 0`；空阵、非矩形、非方阵；N<1、N>32、M<N、M>64。
+- 积分接口额外约束：区域边界须为有限实数且 `x0 < x1`、`y0 < y1`；
+  `rtol > 0`、`atol >= 0`；`min_depth/max_depth/max_evaluations` 为严格 `int`
+  （`bool` 拒绝）且 `min_depth <= max_depth`；`pixel_energy` 的 `i, j` 为
+  `[0, M)` 内严格 `int`。
 - 错误信息包含**可定位参数名**（如 `wavelength` 或 `aperture[i][j]`）。
-- 计算为纯函数，无批次 / 有状态写操作，因此不存在部分变更；不存在搜索类算法，
-  故无“预算耗尽”与“证明无解”之分（本契约的失败模式只有上面的参数拒绝）。
+- 计算为纯函数，无批次 / 有状态写操作，因此不存在部分变更。自适应积分的
+  细分预算耗尽**不是**静默成功：以 `converged=False` 显式报告（`energy`
+  仍为当前最优估计），与正常收敛严格区分。
 
 ## 浮点误差口径（不以宽容差掩盖边界错误）
 
@@ -97,6 +143,9 @@ rectangular_aperture(n, width, height, dx)
 - 矩形孔远场与**离散解析式**（有限等比级数闭式解，非 DFT 计算）逐像元比较
   < 1e-12（按全场最大幅值归一）；单像元常强度用精确相等 / 1e-15 判据。
 - 坐标为整数倍 `du`，用 `1e-20` 绝对判据核对；DC 像元坐标严格为 `0.0`。
+- 像素能量：常强度区域积分与解析值 `scale²·面积` 比较 < 1e-12；散斑区域与
+  测试文件内**独立**固定网格 5 点 Gauss 积分参考比较 < 1e-7 相对；相邻 2x2
+  像素能量之和与同一大区域单次积分互相核对 < 1e-7 相对（demo 实测约 1e-11）。
 
 ## 测试的独立性
 
@@ -108,6 +157,13 @@ rectangular_aperture(n, width, height, dx)
 与对称性、Parseval 独立核功率、零填充功率不变与间距更新、相位斜坡导致的整数像元
 平移（移位定理）、奇偶网格 fftshift 坐标约定、全部错误语义。
 
+积分测试的独立参考（`reference_field` / `reference_integral`，均在测试文件内
+重写）：连续场用逐项 `cmath.exp` 直接求和（不用被测的相位幂次递推），积分用
+固定网格 5 点 Gauss–Legendre（与被测的 3 点自适应规则阶数、节点、细分策略
+均不同）。另含：连续场与 DFT bin 的一致性、`min_depth` 强制细分（常 integrand
+也必须达到指定深度）、预算耗尽时 `converged=False` 且同区域合理容差可收敛、
+相邻像素可加性交叉核对、像素区域坐标精确性。
+
 ## 设计取舍
 
 - Fraunhofer（远场）模型是本库唯一物理模型；不实现 Fresnel / 角谱传播。
@@ -115,6 +171,9 @@ rectangular_aperture(n, width, height, dx)
 - DFT 输入规模很小（≤64），优先正确性与可读性；混合基 + 素数回退使 64 长度变换
   仍是毫秒级，不为此引入第三方库。
 - 接口只接受 Python 原生嵌套序列，返回原生 list，无 numpy 依赖。
+- 像素能量走连续场直接求和（每点 O(N²)），自适应细分把求值集中在亮暗变化
+  快的区域；`max_evaluations` 预算保证最坏情况耗时可控，耗尽时显式报告
+  不收敛而不是返回无保证的数值。
 
 ## 已知限制
 
@@ -125,3 +184,5 @@ rectangular_aperture(n, width, height, dx)
 - 64 点素数回退路径只在非 2/3 因子长度出现（如 M 为素数，最大为 61），仍为
   O(n²)，在本题规模下耗时以毫秒计。
 - 坐标与强度单位假定全部输入以米给出，库内不做单位换算。
+- 连续场把孔径像元 `(m, n)` 置于物理坐标 `((m-n//2)dx, (n-n//2)dx)`（点采样
+  模型，与 DFT 约定一致）；不包含孔径像元本身的面积平均效应。

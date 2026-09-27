@@ -57,6 +57,42 @@ def main() -> None:
     print(f"relative power error (Parseval check) : {result.power_error:+.3e}")
     print(f"elapsed        : {elapsed*1000:.1f} ms")
 
+    # ---- Detector-pixel energies (area integration, not centre x area) -------
+    print()
+    print("=== Detector pixel energies (adaptive area integration) ===")
+    ci, cj = result.center
+    t0 = time.perf_counter()
+    center_energy = fd.pixel_energy(aperture, dx, wavelength, z, ci, cj, pad=64,
+                                    rtol=1e-6)
+    off_energy = fd.pixel_energy(aperture, dx, wavelength, z, ci + 3, cj - 2, pad=64,
+                                 rtol=1e-6)
+    elapsed_pix = time.perf_counter() - t0
+    naive_center = result.intensity[ci][cj] * result.du ** 2
+    print(f"pixel ({ci},{cj}) energy   : {center_energy.energy:.9e} "
+          f"(converged={center_energy.converged}, err<={center_energy.error_estimate:.1e}, "
+          f"depth={center_energy.depth}, evals={center_energy.evaluations})")
+    print(f"  naive I_centre*du^2     : {naive_center:.9e} "
+          f"({(naive_center - center_energy.energy) / center_energy.energy:+.2%} off)")
+    print(f"pixel ({ci+3},{cj-2}) energy : {off_energy.energy:.9e} "
+          f"(converged={off_energy.converged}, err<={off_energy.error_estimate:.1e})")
+
+    # Cross-check: four neighbouring pixels summed vs one integration over
+    # the same total rectangle.
+    block = [
+        fd.pixel_energy(aperture, dx, wavelength, z, ci + di, cj + dj, pad=64,
+                        rtol=1e-8)
+        for di in (0, 1) for dj in (0, 1)
+    ]
+    half = 0.5 * result.du
+    merged = fd.integrate_intensity(aperture, dx, wavelength, z,
+                                    -half, 1.5 * result.du, -half, 1.5 * result.du,
+                                    rtol=1e-8)
+    summed = sum(p.energy for p in block)
+    print(f"2x2 pixels summed       : {summed:.9e}")
+    print(f"same region, one shot   : {merged.energy:.9e} "
+          f"(agree to {abs(summed - merged.energy) / merged.energy:.1e} relative)")
+    print(f"pixel integration time  : {elapsed_pix*1000:.1f} ms (first two pixels)")
+
     # ---- A boundary that really triggers -------------------------------------------
     print()
     print("=== Input rejection boundary (actually raised below) ===")
